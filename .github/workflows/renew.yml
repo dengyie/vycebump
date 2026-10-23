@@ -2,9 +2,9 @@ name: Vyce.cloud Auto Renew
 
 on:
   schedule:
-    # 每 2 小时调度执行一次：CAPTCHA 校验故障在服务端侧波动时，
-    # 更高频的重试能在到期前（任意时刻恢复时）尽快补上续期。
-    - cron: '0 */2 * * *'
+    # 每 2 小时巡检一次。错开整点：GitHub 的定时任务在 :00 极度拥塞，
+    # 实测曾延迟近 1 小时才触发，对「到期前必须跑一次」的场景风险太大。
+    - cron: '17 */2 * * *'
   workflow_dispatch: # 支持 GitHub 控制台手动一键触发
     inputs:
       force:
@@ -23,6 +23,9 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
+    # 单次续期最坏情况约 8 分钟（两次尝试 × 浏览器 120s + 直连 120s）；
+    # 设上限避免异常卡死长期占用 concurrency 队列、拖住后续调度。
+    timeout-minutes: 20
 
     steps:
     - name: Checkout Repository

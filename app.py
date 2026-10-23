@@ -1205,7 +1205,7 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         reason = (
                             "令牌已生成并被服务端拒绝（invalid_captcha）；"
                             "官网手动续期同样报此错，属 vyce.cloud/Bestcap 侧校验故障，"
-                            "下次调度（每 4 小时）会自动重试"
+                            "下次调度（每 2 小时）会自动重试"
                         )
                         print("   ℹ️ 官网手动续期在同一环境下同样失败，本机无需调整。")
                     else:
