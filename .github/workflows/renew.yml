@@ -2,8 +2,9 @@ name: Vyce.cloud Auto Renew
 
 on:
   schedule:
-    # 每 4 小时调度执行一次，及时捕获 24h 冷却期结束的可续期窗口
-    - cron: '0 */4 * * *'
+    # 每 2 小时调度执行一次：CAPTCHA 校验故障在服务端侧波动时，
+    # 更高频的重试能在到期前（任意时刻恢复时）尽快补上续期。
+    - cron: '0 */2 * * *'
   workflow_dispatch: # 支持 GitHub 控制台手动一键触发
     inputs:
       force:
