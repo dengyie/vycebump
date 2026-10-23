@@ -2,13 +2,16 @@
 /*
  * Bestcap CAPTCHA solver for vyce.cloud renewals.
  *
- * Connects to a Chrome DevTools Protocol endpoint, loads the Bestcap frame as a
- * top-level document, triggers the "I'm not a robot" check and reports the
- * token minted by the captcha service.
+ * Connects to a Chrome DevTools Protocol endpoint, opens vyce.cloud, renders the
+ * Bestcap widget through the site's own library, triggers the "I'm not a robot"
+ * check and reports the token minted by the captcha service.
+ *
+ * The captcha frame refuses to run as a top-level document, so it must be
+ * embedded by the page exactly like the official frontend does.
  *
  * With a 4th argument (server id) the script additionally submits the renewal
- * from inside the browser: it opens https://vyce.cloud, installs the session
- * cookie, and POSTs /api/servers/<id>/renew with {"captchaResponse": token}.
+ * from inside the browser: it POSTs /api/servers/<id>/renew with
+ * {"captchaResponse": token} from the already-authenticated page.
  * Renewing from the page itself keeps the request origin, user agent, TLS
  * fingerprint and egress IP identical to the official frontend, which is what
  * the platform's CAPTCHA validation expects.
