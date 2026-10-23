@@ -88,7 +88,7 @@ CAPTCHA_SITEKEY_DEFAULT = os.environ.get("CAPTCHA_SITEKEY") or "bc_site_b05a3b42
 CAPTCHA_PARENT_ORIGIN = "https://vyce.cloud"
 CAPTCHA_SOLVER_SCRIPT = os.path.join(SCRIPT_DIR, "captcha_solver.mjs")
 CHROME_BIN = os.environ.get("CHROME_BIN") or ""
-CAPTCHA_SOLVE_TIMEOUT = 90  # 秒，含浏览器启动与挑战计算
+CAPTCHA_SOLVE_TIMEOUT = 120  # 秒，含浏览器启动、frame 重试与挑战计算
 _sitekey_cache: Dict[str, str] = {}
 
 DEFAULT_UA = (
