@@ -69,6 +69,10 @@ class TestAccountFailureAndCooldown(unittest.TestCase):
         captcha_patcher = patch("app.obtain_captcha_token", return_value=("bc1-test-token", ""))
         captcha_patcher.start()
         self.addCleanup(captcha_patcher.stop)
+        # 强制走「脚本直连」回退路径，避免真实浏览器内续期
+        browser_patcher = patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
+        browser_patcher.start()
+        self.addCleanup(browser_patcher.stop)
 
     @patch("app.send_tg_message")
     @patch("app.VyceClient")

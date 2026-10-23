@@ -251,23 +251,28 @@ def fetch_captcha_sitekey(proxy: Optional[str] = None) -> str:
     return CAPTCHA_SITEKEY_DEFAULT
 
 
-def obtain_captcha_token(proxy: Optional[str] = None) -> Tuple[Optional[str], str]:
-    """启动无头 Chrome 驱动官方 Bestcap 组件，返回 (token, 错误信息)。
+def _run_captcha_solver(
+    proxy: Optional[str] = None,
+    server_id: Optional[str] = None,
+    cookie: str = "",
+) -> Tuple[str, str, int]:
+    """启动无头 Chrome 运行求解脚本，返回 (stdout, stderr_tail, returncode)。
 
-    成功时返回 (token, "")；失败时返回 (None, reason)。CAPTCHA_SOLVER=off
-    时直接返回 (None, "CAPTCHA 自动求解已关闭")。
+    server_id 非空时脚本还会在浏览器内提交续期请求（与官方前端同源、同
+    UA、同出口 IP），cookie 通过 VYCE_COOKIE 环境变量传给脚本。
+    环境不具备求解条件时返回 ("", reason, -1)。
     """
     if not CAPTCHA_ENABLED:
-        return None, "CAPTCHA 自动求解已关闭 (CAPTCHA_SOLVER=off)"
+        return "", "CAPTCHA 自动求解已关闭 (CAPTCHA_SOLVER=off)", -1
 
     chrome = find_chrome()
     if not chrome:
-        return None, "未找到 Chrome/Chromium，可通过 CHROME_BIN 指定可执行文件路径"
+        return "", "未找到 Chrome/Chromium，可通过 CHROME_BIN 指定可执行文件路径", -1
     node = shutil.which("node")
     if not node:
-        return None, "未找到 node（求解脚本依赖 Node 18+）"
+        return "", "未找到 node（求解脚本依赖 Node 18+）", -1
     if not os.path.isfile(CAPTCHA_SOLVER_SCRIPT):
-        return None, f"缺少求解脚本 {os.path.basename(CAPTCHA_SOLVER_SCRIPT)}"
+        return "", f"缺少求解脚本 {os.path.basename(CAPTCHA_SOLVER_SCRIPT)}", -1
 
     sitekey = fetch_captcha_sitekey(proxy)
     port = _free_tcp_port()
@@ -303,27 +308,98 @@ def obtain_captcha_token(proxy: Optional[str] = None) -> Tuple[Optional[str], st
             start_new_session=True,
         )
         if not _wait_for_cdp(port, proc):
-            return None, "Chrome 调试端口未就绪"
+            return "", "Chrome 调试端口未就绪", -1
+
+        solver_args = [node, CAPTCHA_SOLVER_SCRIPT, f"http://127.0.0.1:{port}", sitekey, CAPTCHA_PARENT_ORIGIN]
+        if server_id:
+            solver_args.append(server_id)
+        env = dict(os.environ)
+        if cookie:
+            env["VYCE_COOKIE"] = cookie
 
         result = subprocess.run(
-            [node, CAPTCHA_SOLVER_SCRIPT, f"http://127.0.0.1:{port}", sitekey, CAPTCHA_PARENT_ORIGIN],
+            solver_args,
             capture_output=True,
             text=True,
             timeout=CAPTCHA_SOLVE_TIMEOUT,
+            env=env,
         )
-        token = parse_solver_output(result.stdout)
-        if token:
-            return token, ""
-        reason = (result.stderr or result.stdout or "").strip().splitlines()
-        detail = reason[-1] if reason else f"solver exit {result.returncode}"
-        return None, safe_error_text(detail, 160)
+        stdout = result.stdout or ""
+        if result.returncode != 0 or not stdout.strip():
+            reason = (result.stderr or stdout or "").strip().splitlines()
+            detail = reason[-1] if reason else f"solver exit {result.returncode}"
+            return stdout, safe_error_text(detail, 160), result.returncode
+        return stdout, "", result.returncode
     except subprocess.TimeoutExpired:
-        return None, "CAPTCHA 求解超时"
+        return "", "CAPTCHA 求解超时", -1
     except (OSError, ValueError) as exc:
-        return None, safe_error_text(exc, 160)
+        return "", safe_error_text(exc, 160), -1
     finally:
         _stop_process(proc)
         shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def obtain_captcha_token(proxy: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """仅求解令牌（浏览器不提交续期），返回 (token, 错误信息)。
+
+    成功时返回 (token, "")；失败时返回 (None, reason)。
+    """
+    stdout, reason, rc = _run_captcha_solver(proxy)
+    token = parse_solver_output(stdout)
+    if token:
+        return token, ""
+    return None, reason or "求解器未返回令牌"
+
+
+def parse_renew_output(stdout: str) -> Optional[Dict]:
+    """从求解器 stdout 中提取 "RENEW:{...}" 的 JSON，否则返回 None。"""
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("RENEW:"):
+            payload = line[len("RENEW:"):].strip()
+            try:
+                data = json.loads(payload)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(data, dict):
+                return data
+    return None
+
+
+def renew_with_captcha(
+    proxy: Optional[str],
+    server_id: str,
+    cookie: str,
+) -> Tuple[Optional[Tuple[bool, int, str]], str]:
+    """在无头 Chrome 内完成 CAPTCHA 并提交续期，返回 ((ok, code, msg), "").
+
+    浏览器路径不可用（缺 Chrome/Node、Cookie 被拒等）时返回 (None, reason)，
+    由调用方决定是否回退到脚本直连。
+    """
+    stdout, reason, rc = _run_captcha_solver(proxy, server_id=server_id, cookie=cookie)
+    data = parse_renew_output(stdout)
+    if data is None:
+        return None, reason or "求解器未返回浏览器内续期结果"
+    status = int(data.get("status") or 0)
+    body = data.get("body") or ""
+    if status == 0:
+        return None, safe_error_text(body, 160)
+    return interpret_renew_response(status, body), ""
+
+
+def interpret_renew_response(status: int, body: str) -> Tuple[bool, int, str]:
+    """把续期 HTTP 响应解释为 (success, code, msg)，供 Python 与浏览器路径共用。"""
+    if status in (200, 204):
+        if status == 204 or not body.strip():
+            return True, status, "Renewed successfully"
+        try:
+            response = json.loads(body)
+        except (TypeError, ValueError):
+            return False, status, "Invalid renewal response JSON"
+        if isinstance(response, dict) and response.get("success") is not False:
+            return True, status, safe_error_text(response.get("message") or "Renewed successfully")
+        return False, status, _error_message(body, "Invalid renewal response schema")
+    return False, status, _error_message(body, f"HTTP {status or 'network error'}")
 
 
 def http_request(
@@ -844,17 +920,7 @@ class VyceClient:
         status, _, body = http_request(
             url, method="POST", headers=headers, data=payload, proxy=self.proxy, timeout=25
         )
-        if status in (200, 204):
-            if status == 204 or not body.strip():
-                return True, status, "Renewed successfully"
-            try:
-                response = json.loads(body)
-            except (TypeError, ValueError):
-                return False, status, "Invalid renewal response JSON"
-            if isinstance(response, dict) and response.get("success") is not False:
-                return True, status, safe_error_text(response.get("message") or "Renewed successfully")
-            return False, status, _error_message(body, "Invalid renewal response schema")
-        return False, status, _error_message(body, f"HTTP {status or 'network error'}")
+        return interpret_renew_response(status, body)
 
 
 # ============================================================
@@ -992,25 +1058,32 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
         # 满足续期条件 (进入可续期窗口 或 机器已停止 或 强制续期)
         print(f"   🚀 进入续期窗口或被强制触发，发起续期请求...")
         captcha_error = ""
-        captcha_token = None
-        if CAPTCHA_ENABLED:
-            print(f"   🤖 正在通过无头 Chrome 完成 Bestcap CAPTCHA 验证...")
-            captcha_token, captcha_error = obtain_captcha_token(proxy)
-            if captcha_token:
-                print(f"   ✅ CAPTCHA 验证通过，已获取续期令牌。")
+        success, code, msg = False, 0, ""
+        cookie_header = account.get("cookie") or ""
+        attempts = 2 if CAPTCHA_ENABLED else 1
+        for attempt in range(attempts):
+            if CAPTCHA_ENABLED:
+                # 令牌与请求必须来自同一浏览器会话：服务端会校验来源/出口特征
+                print(f"   🤖 正在通过无头 Chrome 求解 Bestcap CAPTCHA 并在浏览器内提交续期...")
+                browser_result, browser_error = renew_with_captcha(proxy, srv_id, cookie_header)
+                if browser_result is not None:
+                    success, code, msg = browser_result
+                else:
+                    # 浏览器路径不可用：退回脚本直连（仍会尝试提交令牌）
+                    captcha_error = browser_error
+                    print(f"   ⚠️ 浏览器内续期不可用: {browser_error}，改用脚本直连提交...")
+                    captcha_token, token_error = obtain_captcha_token(proxy)
+                    if token_error:
+                        captcha_error = token_error
+                    elif captcha_token:
+                        print(f"   ✅ 已获取续期令牌。")
+                    success, code, msg = client.renew_server(srv_id, captcha_token)
             else:
-                print(f"   ⚠️ CAPTCHA 自动求解失败: {captcha_error}")
+                success, code, msg = client.renew_server(srv_id, None)
 
-        success, code, msg = client.renew_server(srv_id, captcha_token)
-
-        # 令牌可能被服务端消耗或过期：收到 CAPTCHA 报错时重新求解并重试一次
-        if not success and is_captcha_error(code, msg) and CAPTCHA_ENABLED:
-            print(f"   🔁 服务端要求 CAPTCHA（{safe_error_text(msg)}），重新获取令牌并重试一次...")
-            captcha_token, captcha_error = obtain_captcha_token(proxy)
-            if captcha_token:
-                success, code, msg = client.renew_server(srv_id, captcha_token)
-            else:
-                print(f"   ⚠️ CAPTCHA 重新求解失败: {captcha_error}")
+            if success or not is_captcha_error(code, msg) or attempt + 1 >= attempts:
+                break
+            print(f"   🔁 服务端要求 CAPTCHA（{safe_error_text(msg)}），重新求解并重试一次...")
 
         if success:
             print(f"   🎉 续期成功！({msg})")

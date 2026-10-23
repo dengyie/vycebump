@@ -213,18 +213,20 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
         return client
 
     @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
     @patch("app.obtain_captcha_token", return_value=(VALID_TOKEN, ""))
     @patch("app.VyceClient")
-    def test_token_is_used_for_renewal(self, client_cls, obtain, notify):
+    def test_fallback_uses_token_for_direct_renewal(self, client_cls, obtain, browser, notify):
         client = self._stub_client(client_cls, [(True, 200, "Renewed successfully")])
         self.assertTrue(app.process_account(self.account, {}))
         client.renew_server.assert_called_once_with("srv-captcha", VALID_TOKEN)
         self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
 
     @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
     @patch("app.obtain_captcha_token", side_effect=[(None, "Chrome 调试端口未就绪"), (VALID_TOKEN, "")])
     @patch("app.VyceClient")
-    def test_captcha_rejection_retries_once_with_fresh_token(self, client_cls, obtain, notify):
+    def test_captcha_rejection_retries_once_with_fresh_token(self, client_cls, obtain, browser, notify):
         client = self._stub_client(client_cls, [
             (False, 400, "Please complete the CAPTCHA verification."),
             (True, 200, "Renewed successfully"),
@@ -236,25 +238,110 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
         self.assertEqual(client.renew_server.call_args_list[1].args, ("srv-captcha", VALID_TOKEN))
 
     @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
     @patch("app.obtain_captcha_token", return_value=(None, "未找到 Chrome/Chromium，可通过 CHROME_BIN 指定可执行文件路径"))
     @patch("app.VyceClient")
-    def test_failure_notification_includes_captcha_reason(self, client_cls, obtain, notify):
-        client = self._stub_client(client_cls, [(False, 400, "Please complete the CAPTCHA verification.")])
+    def test_failure_notification_includes_captcha_reason(self, client_cls, obtain, browser, notify):
+        client = self._stub_client(client_cls, [
+            (False, 400, "Please complete the CAPTCHA verification."),
+            (False, 400, "Please complete the CAPTCHA verification."),
+        ])
         self.assertFalse(app.process_account(self.account, {}))
-        self.assertEqual(client.renew_server.call_count, 1)
+        # 两次尝试都失败后才告警
+        self.assertEqual(client.renew_server.call_count, 2)
         notify.assert_called_once()
         self.assertIn("CAPTCHA", notify.call_args.kwargs["error_msg"])
         self.assertIn("CHROME_BIN", notify.call_args.kwargs["error_msg"])
 
     @patch("app.send_notification")
+    @patch("app.renew_with_captcha")
     @patch("app.obtain_captcha_token")
     @patch("app.VyceClient")
-    def test_disabled_solver_sends_no_token(self, client_cls, obtain, notify):
+    def test_disabled_solver_sends_no_token(self, client_cls, obtain, browser, notify):
         client = self._stub_client(client_cls, [(True, 200, "Renewed successfully")])
         with patch.object(app, "CAPTCHA_ENABLED", False):
             self.assertTrue(app.process_account(self.account, {}))
         obtain.assert_not_called()
+        browser.assert_not_called()
         client.renew_server.assert_called_once_with("srv-captcha", None)
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=((True, 200, "Renewed successfully"), ""))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_browser_renewal_result_is_authoritative(self, client_cls, obtain, browser, notify):
+        client = self._stub_client(client_cls, [(True, 200, "Renewed successfully")])
+        self.assertTrue(app.process_account(self.account, {}))
+        # 浏览器内续期成功时不再走脚本直连
+        client.renew_server.assert_not_called()
+        obtain.assert_not_called()
+        self.assertEqual(browser.call_args.args[1], "srv-captcha")
+        self.assertEqual(browser.call_args.args[2], self.account["cookie"])
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", side_effect=[
+        ((False, 400, "CAPTCHA verification failed. Please try again."), ""),
+        ((True, 200, "Renewed successfully"), ""),
+    ])
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_browser_renewal_retries_once_on_captcha_error(self, client_cls, obtain, browser, notify):
+        client = self._stub_client(client_cls, [(True, 200, "Renewed successfully")])
+        self.assertTrue(app.process_account(self.account, {}))
+        self.assertEqual(browser.call_count, 2)
+        client.renew_server.assert_not_called()
+
+
+class TestRenewOutputParsing(unittest.TestCase):
+    def test_parses_renew_json_line(self):
+        stdout = 'TOKEN:bc1.abc\nRENEW:{"status":200,"body":"{}"}\n'
+        self.assertEqual(app.parse_renew_output(stdout), {"status": 200, "body": "{}"})
+
+    def test_returns_none_when_renew_line_missing_or_broken(self):
+        for stdout in ("", "TOKEN:bc1.x\n", 'RENEW:not-json\n', 'RENEW:[1,2]\n'):
+            with self.subTest(stdout=stdout):
+                self.assertIsNone(app.parse_renew_output(stdout))
+
+    def test_interpret_maps_status_and_body(self):
+        self.assertEqual(app.interpret_renew_response(204, ""), (True, 204, "Renewed successfully"))
+        self.assertEqual(
+            app.interpret_renew_response(200, '{"success":true,"message":"ok"}'),
+            (True, 200, "ok"),
+        )
+        ok, code, msg = app.interpret_renew_response(
+            400, '{"error":"CAPTCHA verification failed. Please try again."}'
+        )
+        self.assertFalse(ok)
+        self.assertEqual(code, 400)
+        self.assertTrue(app.is_captcha_error(code, msg))
+
+    @patch("app._run_captcha_solver", return_value=(
+        'TOKEN:bc1.' + "a" * 40 + '\nRENEW:{"status":400,"body":"{\\"error\\":\\"CAPTCHA verification failed. Please try again.\\"}"}\n',
+        "", 0,
+    ))
+    def test_renew_with_captcha_interprets_browser_result(self, run):
+        result, reason = app.renew_with_captcha(None, "srv-1", "__Host-vyce_sid=secret")
+        self.assertEqual(reason, "")
+        ok, code, msg = result
+        self.assertFalse(ok)
+        self.assertEqual(code, 400)
+        self.assertTrue(app.is_captcha_error(code, msg))
+        # 浏览器内续期必须把服务端 ID 与 Cookie 传给求解器
+        self.assertEqual(run.call_args.kwargs["server_id"], "srv-1")
+        self.assertEqual(run.call_args.kwargs["cookie"], "__Host-vyce_sid=secret")
+
+    @patch("app._run_captcha_solver", return_value=('TOKEN:bc1.' + "a" * 40 + "\n", "", 0))
+    def test_renew_with_captcha_without_renew_line_is_unusable(self, run):
+        result, reason = app.renew_with_captcha(None, "srv-1", "cookie")
+        self.assertIsNone(result)
+        self.assertIn("续期结果", reason)
+
+    @patch("app._run_captcha_solver", return_value=("", "未找到 Chrome/Chromium", -1))
+    def test_renew_with_captcha_reports_environment_error(self, run):
+        result, reason = app.renew_with_captcha(None, "srv-1", "cookie")
+        self.assertIsNone(result)
+        self.assertIn("Chrome", reason)
 
 
 if __name__ == "__main__":

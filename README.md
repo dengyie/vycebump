@@ -183,11 +183,11 @@ Content-Type: application/json
 该 CAPTCHA（Bestcap）是一套随机化的 WASM 虚拟机工作量证明，无法在 Python 里稳定复现。因此脚本采用「官方组件自行计算」的方式：
 
 1. 启动一个**独立、临时、无头**的 Chrome（随机调试端口 + 临时 profile，用完即删）；
-2. 用 Node 通过 CDP 打开官方验证帧，等待组件就绪后触发校验；
-3. 从网络响应中取出 `status=ok` 的 `token`；
-4. 由 Python 把令牌放进续期请求体。
+2. 用 Node 通过 CDP 加载官方验证组件，等待挑战就绪后触发校验；
+3. 从响应中取出 `status=ok` 的 `token`；
+4. **续期请求也在同一个浏览器会话内发起**：注入会话 Cookie、打开 `vyce.cloud`，再用 `fetch` 提交 `{"captchaResponse": token}`。这样请求的来源、UA、出口 IP 与官方前端完全一致——Bestcap 令牌会校验这些请求侧特征，Python 直连提交会被服务端拒绝。
 
-令牌有效期为数十秒，若服务端仍返回 `400 Please complete the CAPTCHA verification.`，脚本会重新求解并重试一次；两次都失败才发送告警。
+令牌有效期为数十秒，若服务端仍返回 400，脚本会重新求解并重试一次；两次都失败才发送告警。缺少 Chrome/Node 时自动回退到脚本直连（成功率较低，通知中会标注原因）。
 
 运行前提：
 
