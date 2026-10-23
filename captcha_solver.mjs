@@ -163,7 +163,11 @@ async function main() {
   // 和前端一样把控件渲染到页面里，由库自己创建 iframe。
   const rendered = valueOf(await send('Runtime.evaluate', {
     expression: `(()=>{try{
-      window.__bcToken=null;window.__bcError=null;
+      window.__bcToken=null;window.__bcError=null;window.__bcMsgs=[];
+      window.addEventListener('message',(ev)=>{
+        const d=ev.data;
+        if(d&&typeof d==='object'&&d.bc===1) window.__bcMsgs.push(String(d.type||''));
+      },true);
       const host=document.createElement('div');
       host.id='bc-solver-host';
       host.style.cssText='position:fixed;left:8px;top:8px;z-index:2147483647;width:340px;height:96px;background:#fff';
@@ -199,24 +203,44 @@ async function main() {
 
   if (rect && !token) {
     // 真实鼠标事件：合成的 .click() 不被验证码当成用户交互。
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y }, frameSid);
-    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: rect.x, y: rect.y, button: 'left', clickCount: 1 }, frameSid);
-    await sleep(60);
-    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rect.x, y: rect.y, button: 'left', clickCount: 1 }, frameSid);
+    const clickBox = async (box) => {
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y }, frameSid);
+      await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1 }, frameSid);
+      await sleep(60);
+      await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1 }, frameSid);
+    };
+    await clickBox(rect);
 
+    // 控件偶尔会忽略落在 before-interactive 之前的点击，所以定时补点：
+    // 只要令牌还没到、勾选框还在，就当作还没开始解题。
     const solveDeadline = Date.now() + SOLVE_TIMEOUT_MS;
+    let nextClickAt = Date.now() + 6000;
     while (!token && Date.now() < solveDeadline) {
       await sleep(300);
       const state = valueOf(await send('Runtime.evaluate', {
-        expression: `JSON.stringify({t:window.__bcToken||'',e:window.__bcError||''})`,
+        expression: `JSON.stringify({t:window.__bcToken||'',e:window.__bcError||'',m:window.__bcMsgs||[]})`,
         returnByValue: true,
       }));
       let parsed = {};
       try { parsed = JSON.parse(state || '{}'); } catch { /* page navigating */ }
-      if (parsed.t) token = parsed.t;
-      if (!token && parsed.e) throw new Error(`captcha widget error: ${parsed.e}`);
+      if (parsed.t) { token = parsed.t; break; }
+      if (parsed.e) throw new Error(`captcha widget error: ${parsed.e}`);
+
+      if (Date.now() >= nextClickAt) {
+        nextClickAt = Date.now() + 6000;
+        const again = valueOf(await send('Runtime.evaluate', {
+          expression: `(()=>{const b=document.getElementById("check");if(!b)return null;const r=b.getBoundingClientRect();return r.width>=5&&r.height>=5?{x:r.x+r.width/2,y:r.y+r.height/2}:null})()`,
+          returnByValue: true,
+        }, frameSid));
+        if (again) await clickBox(again);
+      }
     }
-    if (!token) throw new Error('captcha solve timeout');
+    if (!token) {
+      const msgs = valueOf(await send('Runtime.evaluate', {
+        expression: `(window.__bcMsgs||[]).join(',')`, returnByValue: true,
+      }));
+      throw new Error(`captcha solve timeout (widget messages: ${msgs || 'none'})`);
+    }
   }
 
   process.stdout.write(`TOKEN:${token}\n`);
