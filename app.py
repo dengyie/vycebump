@@ -169,6 +169,19 @@ def is_captcha_error(code: int, msg: str) -> bool:
     return "captcha" in str(msg).lower()
 
 
+def is_captcha_token_rejected(code: int, msg: str) -> bool:
+    """区分「令牌被拒」与「没交令牌」。
+
+    服务端返回 `invalid_captcha` / `CAPTCHA verification failed` 时，说明
+    请求里带着令牌但校验没过——这一分支与本机求解无关：官网手动续期在同样
+    情况下也会收到完全相同的响应。
+    """
+    if code != 400 or not msg:
+        return False
+    lower = str(msg).lower()
+    return "invalid_captcha" in lower or "verification failed" in lower
+
+
 # ============================================================
 # Bestcap CAPTCHA 自动求解 (无头 Chrome + CDP)
 # ============================================================
@@ -1076,6 +1089,8 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                     if token_error:
                         captcha_error = token_error
                     elif captcha_token:
+                        # 已经有令牌，浏览器路径的告警不再适用于本次结果
+                        captcha_error = ""
                         print(f"   ✅ 已获取续期令牌。")
                     success, code, msg = client.renew_server(srv_id, captcha_token)
             else:
@@ -1184,7 +1199,17 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                 }
                 error_msg = f"HTTP {code}: {safe_error_text(msg)}"
                 if is_captcha_error(code, msg):
-                    reason = captcha_error or "服务端拒绝了本次 CAPTCHA 令牌"
+                    if captcha_error:
+                        reason = captcha_error
+                    elif is_captcha_token_rejected(code, msg):
+                        reason = (
+                            "令牌已生成并被服务端拒绝（invalid_captcha）；"
+                            "官网手动续期同样报此错，属 vyce.cloud/Bestcap 侧校验故障，"
+                            "下次调度（每 4 小时）会自动重试"
+                        )
+                        print("   ℹ️ 官网手动续期在同一环境下同样失败，本机无需调整。")
+                    else:
+                        reason = "服务端未收到有效 CAPTCHA 令牌"
                     error_msg += f"（CAPTCHA: {reason}）"
                 send_notification(
                     status_icon="❌",

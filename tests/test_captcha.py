@@ -42,6 +42,26 @@ class TestCaptchaErrorDetection(unittest.TestCase):
             with self.subTest(code=code, msg=msg):
                 self.assertFalse(app.is_captcha_error(code, msg))
 
+    def test_token_rejection_is_distinguished_from_missing_token(self):
+        rejected = [
+            '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}',
+            "CAPTCHA verification failed. Please try again.",
+            "invalid_captcha",
+        ]
+        for msg in rejected:
+            with self.subTest(msg=msg):
+                self.assertTrue(app.is_captcha_token_rejected(400, msg))
+                self.assertTrue(app.is_captcha_error(400, msg))
+
+        # 未提交令牌时服务端提示「请完成验证」，不能算作令牌被拒
+        for msg in ("Please complete the CAPTCHA verification.", "captcha required"):
+            with self.subTest(msg=msg):
+                self.assertFalse(app.is_captcha_token_rejected(400, msg))
+
+    def test_token_rejection_requires_400(self):
+        self.assertFalse(app.is_captcha_token_rejected(500, "CAPTCHA verification failed."))
+        self.assertFalse(app.is_captcha_token_rejected(400, ""))
+
 
 class TestSolverOutputParsing(unittest.TestCase):
     def test_extracts_token_from_noisy_stdout(self):
@@ -291,6 +311,40 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
         self.assertTrue(app.process_account(self.account, {}))
         self.assertEqual(browser.call_count, 2)
         client.renew_server.assert_not_called()
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_rejected_token_notification_points_at_server_side(self, client_cls, obtain, browser, notify):
+        """令牌已生成却被拒：告警必须指向服务端校验故障，而不是本机环境。"""
+        client = self._stub_client(client_cls, [
+            (False, 400, "CAPTCHA verification failed."),
+            (False, 400, "CAPTCHA verification failed."),
+        ])
+        self.assertFalse(app.process_account(self.account, {}))
+        self.assertEqual(browser.call_count, 2)
+        error_msg = notify.call_args.kwargs["error_msg"]
+        self.assertIn("invalid_captcha", error_msg)
+        self.assertIn("官网手动续期同样报此错", error_msg)
+        self.assertNotIn("CHROME_BIN", error_msg)
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
+    @patch("app.obtain_captcha_token", return_value=(VALID_TOKEN, ""))
+    @patch("app.VyceClient")
+    def test_obtained_token_clears_earlier_browser_error(self, client_cls, obtain, browser, notify):
+        """直连兜底拿到令牌后，不应再把浏览器路径的报错写进告警。"""
+        client = self._stub_client(client_cls, [
+            (False, 400, "CAPTCHA verification failed."),
+            (False, 400, "CAPTCHA verification failed."),
+        ])
+        self.assertFalse(app.process_account(self.account, {}))
+        error_msg = notify.call_args.kwargs["error_msg"]
+        self.assertNotIn("browser path disabled in tests", error_msg)
 
 
 class TestRenewOutputParsing(unittest.TestCase):
