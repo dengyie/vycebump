@@ -51,6 +51,17 @@ class TestWorkflowPolicy(unittest.TestCase):
     def test_no_sensitive_renew_state_in_artifacts(self):
         self.assertNotIn("renew_state.json", self.content)
 
+    def test_captcha_prerequisites_are_verified_before_renewal(self):
+        # 续期需要 Chrome + Node 求解 Bestcap CAPTCHA，缺失时应尽早失败
+        self.assertIn("CAPTCHA_SOLVER", self.content)
+        self.assertIn("CHROME_BIN", self.content)
+        check_index = self.content.find("Verify CAPTCHA Solver Prerequisites")
+        run_index = self.content.find("Run Vyce Renew Script")
+        self.assertGreater(check_index, 0, "缺少 CAPTCHA 前置检查步骤")
+        self.assertGreater(run_index, check_index, "前置检查必须排在续期脚本之前")
+        self.assertIn("command -v node", self.content)
+        self.assertIn("command -v google-chrome", self.content)
+
 
 if __name__ == "__main__":
     unittest.main()

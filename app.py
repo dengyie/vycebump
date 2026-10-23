@@ -18,8 +18,11 @@ import sys
 import json
 import time
 import ssl
+import shutil
+import socket
 import smtplib
 import subprocess
+import tempfile
 import datetime
 import email.message
 import html
@@ -71,6 +74,22 @@ CDP_URL = os.environ.get("CDP_URL") or "http://127.0.0.1:9222"
 FORCE_RENEW = os.environ.get("FORCE_RENEW", "").lower() in ("true", "1", "yes")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(SCRIPT_DIR, "renew_state.json")
+
+# ------------------------------------------------------------
+# CAPTCHA (Bestcap) 求解配置
+#   Vyce 续期接口现在要求请求体携带 captchaResponse，由官方 Bestcap
+#   组件签发。Bestcap 的挑战在 WebAssembly 虚拟机中执行，且每次会话
+#   随机，无法用纯 Python 复刻，因此复用本机无头 Chrome 驱动官方组件。
+#   CAPTCHA_SOLVER=off 可关闭自动求解（续期将按服务端要求失败）。
+# ------------------------------------------------------------
+CAPTCHA_SOLVER_MODE = (os.environ.get("CAPTCHA_SOLVER") or "auto").strip().lower()
+CAPTCHA_ENABLED = CAPTCHA_SOLVER_MODE not in ("off", "false", "0", "no", "disabled")
+CAPTCHA_SITEKEY_DEFAULT = os.environ.get("CAPTCHA_SITEKEY") or "bc_site_b05a3b42a31232929d6194f3"
+CAPTCHA_PARENT_ORIGIN = "https://vyce.cloud"
+CAPTCHA_SOLVER_SCRIPT = os.path.join(SCRIPT_DIR, "captcha_solver.mjs")
+CHROME_BIN = os.environ.get("CHROME_BIN") or ""
+CAPTCHA_SOLVE_TIMEOUT = 90  # 秒，含浏览器启动与挑战计算
+_sitekey_cache: Dict[str, str] = {}
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -141,6 +160,170 @@ def is_renewal_cooldown_error(code: int, msg: str) -> bool:
         "not eligible for renewal",
     )
     return any(pattern in lower for pattern in cooldown_patterns)
+
+
+def is_captcha_error(code: int, msg: str) -> bool:
+    """判定服务端 400 是否因为缺少 / 无效的 CAPTCHA 验证。"""
+    if code != 400 or not msg:
+        return False
+    return "captcha" in str(msg).lower()
+
+
+# ============================================================
+# Bestcap CAPTCHA 自动求解 (无头 Chrome + CDP)
+# ============================================================
+def _chrome_candidates() -> List[str]:
+    candidates = [CHROME_BIN] if CHROME_BIN else []
+    candidates.append("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    return [path for path in candidates if path]
+
+
+def find_chrome() -> Optional[str]:
+    for path in _chrome_candidates():
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_for_cdp(port: int, proc: "subprocess.Popen", timeout: float = 20.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        status, _, _ = http_request(f"http://127.0.0.1:{port}/json/version", timeout=2)
+        if status == 200:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _stop_process(proc: Optional["subprocess.Popen"]) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+def parse_solver_output(stdout: str) -> Optional[str]:
+    """从求解器 stdout 中提取 "TOKEN:<token>"，否则返回 None。"""
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("TOKEN:"):
+            token = line[len("TOKEN:"):].strip()
+            if token.startswith("bc1.") and len(token) > 20:
+                return token
+    return None
+
+
+def fetch_captcha_sitekey(proxy: Optional[str] = None) -> str:
+    """从 /api/config 读取当前 sitekey，读取失败时回退到内置默认值。"""
+    cached = _sitekey_cache.get("value")
+    if cached:
+        return cached
+    status, _, body = http_request(f"{API_BASE}/config", proxy=proxy, timeout=10)
+    if status == 200:
+        try:
+            config = json.loads(body)
+        except (TypeError, ValueError):
+            config = None
+        if isinstance(config, dict):
+            sitekey = config.get("bestcapSitekey")
+            if isinstance(sitekey, str) and re.fullmatch(r"bc_site_[A-Za-z0-9]+", sitekey):
+                _sitekey_cache["value"] = sitekey
+                return sitekey
+    return CAPTCHA_SITEKEY_DEFAULT
+
+
+def obtain_captcha_token(proxy: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """启动无头 Chrome 驱动官方 Bestcap 组件，返回 (token, 错误信息)。
+
+    成功时返回 (token, "")；失败时返回 (None, reason)。CAPTCHA_SOLVER=off
+    时直接返回 (None, "CAPTCHA 自动求解已关闭")。
+    """
+    if not CAPTCHA_ENABLED:
+        return None, "CAPTCHA 自动求解已关闭 (CAPTCHA_SOLVER=off)"
+
+    chrome = find_chrome()
+    if not chrome:
+        return None, "未找到 Chrome/Chromium，可通过 CHROME_BIN 指定可执行文件路径"
+    node = shutil.which("node")
+    if not node:
+        return None, "未找到 node（求解脚本依赖 Node 18+）"
+    if not os.path.isfile(CAPTCHA_SOLVER_SCRIPT):
+        return None, f"缺少求解脚本 {os.path.basename(CAPTCHA_SOLVER_SCRIPT)}"
+
+    sitekey = fetch_captcha_sitekey(proxy)
+    port = _free_tcp_port()
+    profile_dir = tempfile.mkdtemp(prefix="vycebump-chrome-")
+    proc = None
+    try:
+        args = [
+            chrome,
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--mute-audio",
+            f"--user-data-dir={profile_dir}",
+            f"--remote-debugging-port={port}",
+            "about:blank",
+        ]
+        if sys.platform.startswith("linux"):
+            args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+        if proxy:
+            parsed = urllib.parse.urlsplit(proxy)
+            if parsed.hostname and parsed.port:
+                args.append(f"--proxy-server={parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}")
+                args.append("--proxy-bypass-list=127.0.0.1;localhost")
+
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if not _wait_for_cdp(port, proc):
+            return None, "Chrome 调试端口未就绪"
+
+        result = subprocess.run(
+            [node, CAPTCHA_SOLVER_SCRIPT, f"http://127.0.0.1:{port}", sitekey, CAPTCHA_PARENT_ORIGIN],
+            capture_output=True,
+            text=True,
+            timeout=CAPTCHA_SOLVE_TIMEOUT,
+        )
+        token = parse_solver_output(result.stdout)
+        if token:
+            return token, ""
+        reason = (result.stderr or result.stdout or "").strip().splitlines()
+        detail = reason[-1] if reason else f"solver exit {result.returncode}"
+        return None, safe_error_text(detail, 160)
+    except subprocess.TimeoutExpired:
+        return None, "CAPTCHA 求解超时"
+    except (OSError, ValueError) as exc:
+        return None, safe_error_text(exc, 160)
+    finally:
+        _stop_process(proc)
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def http_request(
@@ -650,10 +833,17 @@ class VyceClient:
         self.last_error = _error_message(body, f"HTTP {status or 'network error'}")
         return None
 
-    def renew_server(self, server_id: str) -> Tuple[bool, int, str]:
+    def renew_server(self, server_id: str, captcha_response: Optional[str] = None) -> Tuple[bool, int, str]:
         """Return success, HTTP status, and a bounded non-sensitive message."""
         url = f"{API_BASE}/servers/{urllib.parse.quote(server_id, safe='')}/renew"
-        status, _, body = http_request(url, method="POST", headers=self.headers, proxy=self.proxy, timeout=20)
+        headers = dict(self.headers)
+        payload = None
+        if captcha_response:
+            headers["Content-Type"] = "application/json"
+            payload = json.dumps({"captchaResponse": captcha_response}).encode("utf-8")
+        status, _, body = http_request(
+            url, method="POST", headers=headers, data=payload, proxy=self.proxy, timeout=25
+        )
         if status in (200, 204):
             if status == 204 or not body.strip():
                 return True, status, "Renewed successfully"
@@ -801,7 +991,26 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
 
         # 满足续期条件 (进入可续期窗口 或 机器已停止 或 强制续期)
         print(f"   🚀 进入续期窗口或被强制触发，发起续期请求...")
-        success, code, msg = client.renew_server(srv_id)
+        captcha_error = ""
+        captcha_token = None
+        if CAPTCHA_ENABLED:
+            print(f"   🤖 正在通过无头 Chrome 完成 Bestcap CAPTCHA 验证...")
+            captcha_token, captcha_error = obtain_captcha_token(proxy)
+            if captcha_token:
+                print(f"   ✅ CAPTCHA 验证通过，已获取续期令牌。")
+            else:
+                print(f"   ⚠️ CAPTCHA 自动求解失败: {captcha_error}")
+
+        success, code, msg = client.renew_server(srv_id, captcha_token)
+
+        # 令牌可能被服务端消耗或过期：收到 CAPTCHA 报错时重新求解并重试一次
+        if not success and is_captcha_error(code, msg) and CAPTCHA_ENABLED:
+            print(f"   🔁 服务端要求 CAPTCHA（{safe_error_text(msg)}），重新获取令牌并重试一次...")
+            captcha_token, captcha_error = obtain_captcha_token(proxy)
+            if captcha_token:
+                success, code, msg = client.renew_server(srv_id, captcha_token)
+            else:
+                print(f"   ⚠️ CAPTCHA 重新求解失败: {captcha_error}")
 
         if success:
             print(f"   🎉 续期成功！({msg})")
@@ -900,12 +1109,16 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                     "error": safe_error_text(msg),
                     "last_check_ts": now_ms,
                 }
+                error_msg = f"HTTP {code}: {safe_error_text(msg)}"
+                if is_captcha_error(code, msg):
+                    reason = captcha_error or "服务端拒绝了本次 CAPTCHA 令牌"
+                    error_msg += f"（CAPTCHA: {reason}）"
                 send_notification(
                     status_icon="❌",
                     status_title="Vyce VPS 续期失败",
                     account_name=real_username,
                     details=details,
-                    error_msg=f"HTTP {code}: {safe_error_text(msg)}",
+                    error_msg=error_msg,
                     proxy=proxy,
                 )
 

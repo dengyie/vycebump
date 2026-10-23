@@ -65,6 +65,10 @@ class TestAccountFailureAndCooldown(unittest.TestCase):
             "id": "srv-test", "name": "Test VPS", "source": "free", "status": "running",
             "expiresAt": self.now + app.ONE_HOUR_MS,
         }
+        # 单元测试中绝不启动真实 Chrome 求解 CAPTCHA
+        captcha_patcher = patch("app.obtain_captcha_token", return_value=("bc1-test-token", ""))
+        captcha_patcher.start()
+        self.addCleanup(captcha_patcher.stop)
 
     @patch("app.send_tg_message")
     @patch("app.VyceClient")

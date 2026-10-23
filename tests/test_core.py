@@ -70,6 +70,10 @@ class TestCooldownAndRenewalLogic(unittest.TestCase):
     def setUp(self):
         self.account = {"name": "TestUser", "cookie": "__Host-vyce_sid=mock_cookie"}
         self.state = {}
+        # 单元测试中绝不启动真实 Chrome 求解 CAPTCHA
+        captcha_patcher = patch("app.obtain_captcha_token", return_value=("bc1-test-token", ""))
+        self.mock_captcha = captcha_patcher.start()
+        self.addCleanup(captcha_patcher.stop)
 
     @patch("app.send_notification")
     @patch("app.VyceClient")
@@ -133,7 +137,7 @@ class TestCooldownAndRenewalLogic(unittest.TestCase):
 
         ok = process_account(self.account, self.state)
         self.assertTrue(ok)
-        client.renew_server.assert_called_once_with("srv-2")
+        client.renew_server.assert_called_once_with("srv-2", "bc1-test-token")
         self.assertEqual(self.state["srv-2"]["status"], "success")
 
     @patch("app.send_notification")

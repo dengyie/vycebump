@@ -36,6 +36,39 @@ jobs:
     - name: Run Unit Tests
       run: python3 -m unittest discover -s tests -v
 
+    # 续期需要先通过 Bestcap CAPTCHA：由无头 Chrome + Node 求解器完成
+    - name: Verify CAPTCHA Solver Prerequisites
+      env:
+        CAPTCHA_SOLVER: ${{ vars.CAPTCHA_SOLVER || 'auto' }}
+        CHROME_BIN: ${{ vars.CHROME_BIN }}
+      run: |
+        case "$(echo "${CAPTCHA_SOLVER:-auto}" | tr '[:upper:]' '[:lower:]')" in
+          off|false|0|no|disabled)
+            echo "ℹ️ CAPTCHA_SOLVER 已关闭，跳过前置检查。"
+            exit 0
+            ;;
+        esac
+
+        if ! command -v node >/dev/null 2>&1; then
+          echo "❌ 未找到 node，Bestcap CAPTCHA 求解脚本需要 Node 18+。"
+          exit 1
+        fi
+        if ! node -e 'const major = Number(process.versions.node.split(".")[0]); process.exit(major >= 18 ? 0 : 1)'; then
+          echo "❌ Node 版本过低 ($(node -v))，需要 18+。"
+          exit 1
+        fi
+
+        if [ -n "${CHROME_BIN:-}" ]; then
+          CHROME="$CHROME_BIN"
+        else
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+        fi
+        if [ -z "$CHROME" ] || [ ! -x "$CHROME" ]; then
+          echo "❌ 未找到 Chrome/Chromium，无法完成续期 CAPTCHA（可用 vars.CHROME_BIN 指定路径）。"
+          exit 1
+        fi
+        echo "✅ CAPTCHA 前置条件就绪: node $(node -v) / $("$CHROME" --version)"
+
     # (可选) 代理环境启动 (sing-box 支持全协议)
     - name: Start Proxy (sing-box)
       id: proxy
@@ -114,6 +147,8 @@ jobs:
         ONEMAIL_FROM_NAME: ${{ secrets.ONEMAIL_FROM_NAME }}
         FORCE_RENEW: ${{ inputs.force || 'false' }}
         PROXY_SERVER: ${{ steps.proxy.outputs.proxy_server }}
+        CAPTCHA_SOLVER: ${{ vars.CAPTCHA_SOLVER || 'auto' }}
+        CHROME_BIN: ${{ vars.CHROME_BIN }}
       run: python3 app.py
 
     - name: Upload Diagnostic Logs

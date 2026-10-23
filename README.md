@@ -54,8 +54,9 @@ Vyce.cloud 为免费 VPS（如 `Vps-Mini`，1 vCore / 2 GB RAM / 6 GB NVMe / 纯
   - **模式 B · GitHub Actions 云端调度** — 配置 Secret 后每 4 小时自动巡检续期，零成本、零维护。
 - **冷却期智能跳过** — 内置倒计时推算，冷却期内直接跳过续期请求，减少无效调用与被平台频控的风险。
 - **全协议代理支持** — 内置 `proxy_handler.py`，支持 VLESS、VMess、Hysteria2、TUIC、Trojan、AnyTLS、SOCKS5、HTTP(S)，以及双跳链式代理；Actions 中自动拉起 sing-box 并做健康探测。
+- **自动过 Bestcap CAPTCHA** — Vyce 续期接口要求提交 CAPTCHA 令牌。脚本用无头 Chrome + CDP 驱动官方验证组件完成校验，再把令牌随续期请求提交；令牌失效时自动重新求解并重试一次。
 - **双渠道实时推送** — Telegram 与邮件（SMTP）通知，账号脱敏、服务器状态、剩余存活时间、下次续期窗口与错误告警；两类渠道各自独立配置，配了哪个发哪个，可同时启用。邮件仅用标准库 `smtplib` 实现，保持零依赖。
-- **64 个单元测试** — 覆盖核心算法、状态边界、CDP 与代理安全策略、三渠道通知，CI 每次运行前自动执行。
+- **84 个单元测试** — 覆盖核心算法、状态边界、CAPTCHA 求解与重试、CDP 与代理安全策略、三渠道通知，CI 每次运行前自动执行。
 
 ## 快速开始
 
@@ -93,6 +94,8 @@ Vyce.cloud 为免费 VPS（如 `Vps-Mini`，1 vCore / 2 GB RAM / 6 GB NVMe / 纯
    ```
 
 4. 进入仓库 **Actions** 页面，点击 **Enable workflow** 启用定时调度，然后选择 **Vyce.cloud Auto Renew → Run workflow** 做一次手动验证。
+
+> ⚠️ 续期需要完成 Bestcap CAPTCHA：工作流会先检查 `node`（18+）与 Chrome/Chromium。`ubuntu-latest` 运行器已预装两者，通常无需额外配置；若使用自建运行器或自定义路径，可通过仓库 **Variables** 设置 `CHROME_BIN`。
 
 工作流默认每 4 小时运行一次（`0 */4 * * *`），并支持手动指定 `force` 强制续期（忽略冷却保护，用于调试）。
 
@@ -156,12 +159,45 @@ python3 app.py
 | `PROXY_URL` | 全协议节点分享链接（Actions 中拉起 sing-box 并健康探测） | `hy2://pwd@host:port?sni=...` | 空 |
 | `PROXY_CHAIN_URL` | 二级链式代理节点，与 `PROXY_URL` 组成双跳（代码支持，默认工作流未注入，需自行加 env） | `socks5://127.0.0.1:1080` | 空 |
 | `ALLOW_INSECURE_PROXY` | 允许节点携带 `insecure=1`（跳过 TLS 证书校验；默认工作流未注入，需自行加 env） | `1` / `true` | 关闭 |
+| `CAPTCHA_SOLVER` | CAPTCHA 求解模式：`auto` 自动求解；`off` 关闭（续期大概率返回 400） | `auto` / `off` | `auto` |
+| `CHROME_BIN` | 自定义 Chrome/Chromium 可执行文件路径（未设置时自动探测常见安装位置） | `/usr/bin/google-chrome` | 空 |
+| `CAPTCHA_SITEKEY` | Bestcap sitekey 兜底值；正常情况下会从 `/api/config` 自动读取最新值 | `bc_site_...` | 内置默认值 |
 
 > 冷却期内的 `429 renewal_cooldown` 属于**预期状态**：脚本记录下次可续期窗口、正常退出（状态码 0），不会告警。
 
 **邮箱通知快速配置（以 QQ 邮箱为例）**：邮箱设置 → 账户 → 开启 SMTP 服务并生成授权码，然后配置 Secrets：`SMTP_HOST=smtp.qq.com`、`SMTP_PORT=465`、`SMTP_USERNAME=你的QQ邮箱`、`SMTP_PASSWORD=授权码`、`EMAIL_TO=接收邮箱`。Gmail（`smtp.gmail.com` + 应用专用密码）、Outlook、企业自建 SMTP 同理，只需换主机与端口。
 
 **或者：接自建 One-Mail 实例直接 HTTP API 发信（无需 SMTP 授权码）**：配置 `ONEMAIL_BASE_URL=https://你的实例`、`ONEMAIL_CREDENTIAL=<凭据>`、`EMAIL_TO=接收邮箱` 即可。`user` 模式填邮箱地址 JWT（发件人即该地址，要求 `send_balance > 0`）；`admin` 模式填管理密码并加配 `EMAIL_FROM` 指定发件地址。One-Mail 侧需已配置发信通道（Resend / SMTP / SEND_MAIL binding）。SMTP 与 One-Mail 两个邮箱渠道各自独立，配了哪个走哪个，都不冲突。
+
+## CAPTCHA 自动求解
+
+Vyce 的续期接口现在要求请求体带上 CAPTCHA 令牌：
+
+```http
+POST /api/servers/{id}/renew
+Content-Type: application/json
+
+{"captchaResponse":"bc1.xxxxx"}
+```
+
+该 CAPTCHA（Bestcap）是一套随机化的 WASM 虚拟机工作量证明，无法在 Python 里稳定复现。因此脚本采用「官方组件自行计算」的方式：
+
+1. 启动一个**独立、临时、无头**的 Chrome（随机调试端口 + 临时 profile，用完即删）；
+2. 用 Node 通过 CDP 打开官方验证帧，等待组件就绪后触发校验；
+3. 从网络响应中取出 `status=ok` 的 `token`；
+4. 由 Python 把令牌放进续期请求体。
+
+令牌有效期为数十秒，若服务端仍返回 `400 Please complete the CAPTCHA verification.`，脚本会重新求解并重试一次；两次都失败才发送告警。
+
+运行前提：
+
+| 依赖 | 说明 |
+| :--- | :--- |
+| Node 18+ | 求解脚本 `captcha_solver.mjs` 使用内置 `fetch` / `WebSocket`，无需 `npm install` |
+| Chrome / Chromium | 由脚本以 `--headless=new` 启动；Linux 下自动追加 `--no-sandbox` |
+| 网络 | 需能访问 `vyce.cloud` 与 `captcha.vyceai.com`；配置 `PROXY_SERVER` 时会透传给 Chrome（回环地址直连） |
+
+如果机器上确实没有浏览器，可设置 `CAPTCHA_SOLVER=off` 关闭求解，但续期会因此失败——通知中会明确标注 CAPTCHA 原因。
 
 ## 安全与执行策略
 
@@ -176,7 +212,10 @@ python3 app.py
 ## 常见问题
 
 **Q：会不会被判定为异常流量 / 封号？**
-A：脚本只在冷却结束、进入可续期窗口后调用一次官方续期接口，其余时间仅做少量状态查询，请求频率远低于人工点面板；不注入页面脚本、不模拟点击，Actions 模式下也不依赖浏览器。
+A：脚本只在冷却结束、进入可续期窗口后调用一次官方续期接口，其余时间仅做少量状态查询，请求频率远低于人工点面板。CAPTCHA 由脚本启动的临时无头浏览器加载官方组件完成，不做逆向绕过、不伪造验证结果，每次续期只求解一次。
+
+**Q：CAPTCHA 求解失败了怎么办？**
+A：先看通知里的 `CAPTCHA:` 后缀。常见原因是缺少 Chrome 或 Node、`CHROME_BIN` 路径不对、代理阻断了 `captcha.vyceai.com`。可以在本地执行 `node captcha_solver.mjs http://127.0.0.1:9222`（配合已开启调试端口的 Chrome）单独验证求解器是否可用。要临时关闭求解可设 `CAPTCHA_SOLVER=off`，但此时续期会失败。
 
 **Q：Cookie 会过期吗？**
 A：会。Vyce 的会话 Cookie 有有效期，失效后续期会返回鉴权错误并触发 Telegram 告警，此时重新获取 `__Host-vyce_sid` 更新 Secret 即可。本地 CDP 模式无需手动维护 Cookie，只要 Chrome 保持登录状态，每次运行都会自动抓取最新会话。
@@ -197,7 +236,7 @@ A：支持，通过 `USERS_JSON` 配置，脚本会逐个账号串行处理并�
 A：关机状态（48h 内未续期）仍可通过续期重置存活时间；**关机超过 3 天被彻底销毁**后无法恢复，只能重新创建。
 
 **Q：需要 `pip install` 吗？**
-A：不需要。项目零第三方依赖，仅本地 CDP 模式额外需要系统里有 `node`。
+A：不需要。项目零第三方依赖。但**续期需要本机具备 Node 18+ 与 Chrome/Chromium**（用于完成 CAPTCHA；本地 CDP 取 Cookie 也依赖 Node）。
 
 **Q：本地同时设置了 `VYCE_COOKIE`，为什么没走 CDP 自动抓取？**
 A：账号来源有优先级：只要 `USERS_JSON` 或 `VYCE_COOKIE` 能解析出账号，脚本就不会再去连 Chrome；只有两者都为空时才启用 CDP 探测。想让本地运行始终使用浏览器里的最新会话，就不要设置这两个变量。
@@ -205,7 +244,7 @@ A：账号来源有优先级：只要 `USERS_JSON` 或 `VYCE_COOKIE` 能解析�
 ## 开发与测试
 
 ```bash
-# 运行全部单元测试（64 个，无需额外依赖）
+# 运行全部单元测试（84 个，无需额外依赖，也不会启动浏览器）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -213,9 +252,10 @@ python3 -m unittest discover -s tests -v
 
 ```text
 vycebump/
-├── app.py              # 主程序：CDP 取 Cookie、续期、状态与通知
+├── app.py              # 主程序：CDP 取 Cookie、CAPTCHA 求解调度、续期、状态与通知
+├── captcha_solver.mjs  # 无头 Chrome + CDP 求解 Bestcap CAPTCHA（Node 18+，零依赖）
 ├── proxy_handler.py    # 代理分享链接 → sing-box 配置生成
-├── tests/              # 单元测试：核心算法 / CDP 安全 / 代理安全 / 工作流策略
+├── tests/              # 单元测试：核心算法 / CAPTCHA / CDP 安全 / 代理安全 / 工作流策略
 └── .github/workflows/  # Actions 定时续期工作流
 ```
 
