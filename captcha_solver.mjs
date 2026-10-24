@@ -249,6 +249,8 @@ async function main() {
   process.stdout.write(`TOKEN:${token}\n`);
 
   if (RENEW_SERVER_ID) {
+    // Bestcap 令牌生成后，给验证码后端与页面 1.5 秒同步就绪时间，避免立即 siteverify 遇到副本同步延迟
+    await sleep(1500);
     const renew = await renewInBrowser(send, token, sessionId);
     process.stdout.write(`RENEW:${renew}\n`);
   }

@@ -220,13 +220,30 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
             "status": "running",
             "expiresAt": self.now + 10 * app.ONE_HOUR_MS,
         }
+        self.sleep_patcher = patch("app.time.sleep")
+        self.sleep_patcher.start()
 
-    def _stub_client(self, client_cls, renew_results):
+    def tearDown(self):
+        self.sleep_patcher.stop()
+
+    def _stub_client(self, client_cls, renew_results, refreshed_servers=None):
         client = MagicMock()
         client.get_me.return_value = {"login": "testuser"}
+        has_success = any(
+            (r[0] if isinstance(r, (tuple, list)) else bool(r))
+            for r in renew_results
+            if isinstance(r, (tuple, list)) and len(r) > 0
+        )
+        default_refresh = (
+            [dict(self.server, expiresAt=self.now + 48 * app.ONE_HOUR_MS)]
+            if has_success
+            else [self.server]
+        )
+        second_servers = refreshed_servers if refreshed_servers is not None else default_refresh
         client.get_servers.side_effect = [
             [self.server],
-            [dict(self.server, expiresAt=self.now + 48 * app.ONE_HOUR_MS)],
+            second_servers,
+            second_servers,
         ]
         client.renew_server.side_effect = renew_results
         client_cls.return_value = client
@@ -345,6 +362,50 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
         self.assertFalse(app.process_account(self.account, {}))
         error_msg = notify.call_args.kwargs["error_msg"]
         self.assertNotIn("browser path disabled in tests", error_msg)
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_browser_renewal_succeeds_if_server_expires_updated_despite_400(self, client_cls, obtain, browser, notify):
+        """续期接口报 400 invalid_captcha 但服务端实际已延期：二次核验判定成功。"""
+        renewed_server = dict(self.server, expiresAt=self.now + 48 * app.ONE_HOUR_MS)
+        client = self._stub_client(
+            client_cls,
+            [(False, 400, "CAPTCHA verification failed.")],
+            refreshed_servers=[renewed_server],
+        )
+        state = {}
+        ok = app.process_account(self.account, state)
+        self.assertTrue(ok)
+        self.assertEqual(state["srv-captcha"]["status"], "success")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
+    @patch("app.obtain_captcha_token", return_value=(VALID_TOKEN, ""))
+    @patch("app.VyceClient")
+    def test_direct_renewal_succeeds_if_server_expires_updated_despite_400(self, client_cls, obtain, browser, notify):
+        """直连提交报 400 但二次核验发现机器到期时间已更新：判定为成功。"""
+        renewed_server = dict(self.server, expiresAt=self.now + 48 * app.ONE_HOUR_MS)
+        client = self._stub_client(
+            client_cls,
+            [
+                (False, 400, "CAPTCHA verification failed."),
+                (False, 400, "CAPTCHA verification failed."),
+            ],
+            refreshed_servers=[renewed_server],
+        )
+        state = {}
+        ok = app.process_account(self.account, state)
+        self.assertTrue(ok)
+        self.assertEqual(state["srv-captcha"]["status"], "success")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
 
 
 class TestRenewOutputParsing(unittest.TestCase):

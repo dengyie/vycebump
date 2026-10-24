@@ -1075,6 +1075,9 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
         cookie_header = account.get("cookie") or ""
         attempts = 2 if CAPTCHA_ENABLED else 1
         for attempt in range(attempts):
+            if attempt > 0:
+                # 重新尝试前短暂等待，避免连续请求触发 Bestcap 频控或状态竞争
+                time.sleep(3)
             if CAPTCHA_ENABLED:
                 # 令牌与请求必须来自同一浏览器会话：服务端会校验来源/出口特征
                 print(f"   🤖 正在通过无头 Chrome 求解 Bestcap CAPTCHA 并在浏览器内提交续期...")
@@ -1100,10 +1103,31 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                 break
             print(f"   🔁 服务端要求 CAPTCHA（{safe_error_text(msg)}），重新求解并重试一次...")
 
+        fresh_srv = None
+        if not success:
+            # 无论续期请求返回何种非 200 响应（HTTP 400 invalid_captcha、429 等），
+            # 均二次查询服务端服务器列表，核验 expiresAt 是否实际上已被服务端延期
+            fresh_servers = client.get_servers()
+            if fresh_servers:
+                check_srv = next((s for s in fresh_servers if s.get("id") == srv_id), None)
+                if check_srv and isinstance(check_srv.get("expiresAt"), (int, float)):
+                    if check_srv["expiresAt"] > expires_at + 60_000:
+                        print(
+                            f"   ✨ 续期请求返回 HTTP {code} ({safe_error_text(msg)})，"
+                            f"但经状态核验到期时间已更新（{ms_to_beijing_str(expires_at)} -> {ms_to_beijing_str(check_srv['expiresAt'])}），"
+                            f"实际续期已成功！"
+                        )
+                        success = True
+                        msg = f"Renewed successfully (verified via server expiresAt: {ms_to_beijing_str(check_srv['expiresAt'])})"
+                        fresh_srv = check_srv
+
         if success:
             print(f"   🎉 续期成功！({msg})")
-            # 重新拉取服务器最新状态
-            fresh_servers = client.get_servers()
+            if fresh_srv is None:
+                # 重新拉取服务器最新状态
+                fresh_servers = client.get_servers()
+            else:
+                fresh_servers = [fresh_srv]
             if fresh_servers is None:
                 error = client.last_error or "续期后无法刷新服务器状态"
                 print(f"   ⚠️ 续期请求已接受，但状态刷新失败: {error}")
