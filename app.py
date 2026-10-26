@@ -415,6 +415,25 @@ def interpret_renew_response(status: int, body: str) -> Tuple[bool, int, str]:
     return False, status, _error_message(body, f"HTTP {status or 'network error'}")
 
 
+def interpret_start_response(status: int, body: str) -> Tuple[bool, int, str]:
+    """把开机/唤醒 HTTP 响应解释为 (success, code, msg)。"""
+    if status in (200, 204):
+        if status == 204 or not body.strip():
+            return True, status, "Server started"
+        try:
+            response = json.loads(body)
+        except (TypeError, ValueError):
+            return False, status, "Invalid start response JSON"
+        if isinstance(response, dict):
+            srv = response.get("server")
+            if isinstance(srv, dict):
+                return True, status, "Server started"
+            if response.get("success") is not False:
+                return True, status, safe_error_text(response.get("message") or "Server started")
+        return False, status, _error_message(body, "Invalid start response schema")
+    return False, status, _error_message(body, f"HTTP {status or 'network error'}")
+
+
 def http_request(
     url: str,
     method: str = "GET",
@@ -935,6 +954,18 @@ class VyceClient:
         )
         return interpret_renew_response(status, body)
 
+    def start_server(self, server_id: str) -> Tuple[bool, int, str]:
+        """发起开机/复活请求: POST /api/servers/{id}/start，返回 (success, code, msg)。"""
+        url = f"{API_BASE}/servers/{urllib.parse.quote(server_id, safe='')}/start"
+        headers = dict(self.headers)
+        headers["Content-Type"] = "application/json"
+        headers["Origin"] = BASE_URL
+        headers["Referer"] = f"{BASE_URL}/"
+        status, _, body = http_request(
+            url, method="POST", headers=headers, data=b"{}", proxy=self.proxy, timeout=25
+        )
+        return interpret_start_response(status, body)
+
 
 # ============================================================
 # 状态持久化与单服务器续期逻辑
@@ -1073,38 +1104,61 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
         captcha_error = ""
         success, code, msg = False, 0, ""
         cookie_header = account.get("cookie") or ""
-        attempts = 2 if CAPTCHA_ENABLED else 1
-        for attempt in range(attempts):
-            if attempt > 0:
-                # 重新尝试前短暂等待，避免连续请求触发 Bestcap 频控或状态竞争
-                time.sleep(3)
-            if CAPTCHA_ENABLED:
-                # 令牌与请求必须来自同一浏览器会话：服务端会校验来源/出口特征
-                print(f"   🤖 正在通过无头 Chrome 求解 Bestcap CAPTCHA 并在浏览器内提交续期...")
-                browser_result, browser_error = renew_with_captcha(proxy, srv_id, cookie_header)
-                if browser_result is not None:
-                    success, code, msg = browser_result
-                else:
-                    # 浏览器路径不可用：退回脚本直连（仍会尝试提交令牌）
-                    captcha_error = browser_error
-                    print(f"   ⚠️ 浏览器内续期不可用: {browser_error}，改用脚本直连提交...")
-                    captcha_token, token_error = obtain_captcha_token(proxy)
-                    if token_error:
-                        captcha_error = token_error
-                    elif captcha_token:
-                        # 已经有令牌，浏览器路径的告警不再适用于本次结果
-                        captcha_error = ""
-                        print(f"   ✅ 已获取续期令牌。")
-                    success, code, msg = client.renew_server(srv_id, captcha_token)
-            else:
-                success, code, msg = client.renew_server(srv_id, None)
-
-            if success or not is_captcha_error(code, msg) or attempt + 1 >= attempts:
-                break
-            print(f"   🔁 服务端要求 CAPTCHA（{safe_error_text(msg)}），重新求解并重试一次...")
-
         fresh_srv = None
+
+        # 策略 1: 机器已关机或存活时间已用尽 (time_left_ms <= 0)，优先走官方原生 start 兜底接口
+        # 官方平台机制：对 stopped 或已过期的服务器调用 start 接口时直接按 "Renew and start" 处理，无需 CAPTCHA
+        if status == "stopped" or time_left_ms <= 0:
+            print(f"   ⚡ 检测到服务器状态为 {status} 且存活时间已到期或关机，优先调用 start 接口唤醒/续期 (Renew and start)...")
+            start_ok, start_code, start_msg = client.start_server(srv_id)
+            if start_ok:
+                fresh_servers = client.get_servers()
+                if fresh_servers:
+                    check_srv = next((s for s in fresh_servers if s.get("id") == srv_id), None)
+                    if check_srv and (
+                        check_srv.get("expiresAt", 0) > expires_at + 60_000
+                        or (check_srv.get("status") == "running" and check_srv.get("expiresAt", 0) > now_ms)
+                    ):
+                        print(f"   🎉 start 接口调用成功，服务器已唤醒并成功续期！(到期: {ms_to_beijing_str(check_srv['expiresAt'])})")
+                        success = True
+                        code = start_code
+                        msg = "Renewed and started via start API"
+                        fresh_srv = check_srv
+            if not success:
+                print(f"   ⚠️ start 接口未直接完成续期 (HTTP {start_code}: {safe_error_text(start_msg)})，继续尝试 CAPTCHA 续期流程...")
+
         if not success:
+            attempts = 2 if CAPTCHA_ENABLED else 1
+            for attempt in range(attempts):
+                if attempt > 0:
+                    # 重新尝试前短暂等待，避免连续请求触发 Bestcap 频控或状态竞争
+                    time.sleep(3)
+                if CAPTCHA_ENABLED:
+                    # 令牌与请求必须来自同一浏览器会话：服务端会校验来源/出口特征
+                    print(f"   🤖 正在通过无头 Chrome 求解 Bestcap CAPTCHA 并在浏览器内提交续期...")
+                    browser_result, browser_error = renew_with_captcha(proxy, srv_id, cookie_header)
+                    if browser_result is not None:
+                        success, code, msg = browser_result
+                    else:
+                        # 浏览器路径不可用：退回脚本直连（仍会尝试提交令牌）
+                        captcha_error = browser_error
+                        print(f"   ⚠️ 浏览器内续期不可用: {browser_error}，改用脚本直连提交...")
+                        captcha_token, token_error = obtain_captcha_token(proxy)
+                        if token_error:
+                            captcha_error = token_error
+                        elif captcha_token:
+                            # 已经有令牌，浏览器路径的告警不再适用于本次结果
+                            captcha_error = ""
+                            print(f"   ✅ 已获取续期令牌。")
+                        success, code, msg = client.renew_server(srv_id, captcha_token)
+                else:
+                    success, code, msg = client.renew_server(srv_id, None)
+
+                if success or not is_captcha_error(code, msg) or attempt + 1 >= attempts:
+                    break
+                print(f"   🔁 服务端要求 CAPTCHA（{safe_error_text(msg)}），重新求解并重试一次...")
+
+        if not success and fresh_srv is None:
             # 无论续期请求返回何种非 200 响应（HTTP 400 invalid_captcha、429 等），
             # 均二次查询服务端服务器列表，核验 expiresAt 是否实际上已被服务端延期
             fresh_servers = client.get_servers()
@@ -1120,6 +1174,22 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         success = True
                         msg = f"Renewed successfully (verified via server expiresAt: {ms_to_beijing_str(check_srv['expiresAt'])})"
                         fresh_srv = check_srv
+                    elif check_srv.get("status") == "stopped" or check_srv.get("expiresAt", 0) <= now_ms:
+                        # 续期未成功且机器处于停机或已超时状态，追加尝试 start 兜底唤醒
+                        print(f"   ⚡ 续期未成功且机器处于 {check_srv.get('status')} 状态，追加尝试 start 兜底...")
+                        st_ok, st_code, st_msg = client.start_server(srv_id)
+                        if st_ok:
+                            st_servers = client.get_servers()
+                            if st_servers:
+                                st_srv = next((s for s in st_servers if s.get("id") == srv_id), None)
+                                if st_srv and (
+                                    st_srv.get("expiresAt", 0) > expires_at + 60_000
+                                    or (st_srv.get("status") == "running" and st_srv.get("expiresAt", 0) > now_ms)
+                                ):
+                                    print(f"   🎉 追加 start 兜底成功，服务器已启动并续期！(到期: {ms_to_beijing_str(st_srv['expiresAt'])})")
+                                    success = True
+                                    msg = "Renewed and started via start API fallback"
+                                    fresh_srv = st_srv
 
         if success:
             print(f"   🎉 续期成功！({msg})")
@@ -1222,6 +1292,7 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                     "last_check_ts": now_ms,
                 }
                 error_msg = f"HTTP {code}: {safe_error_text(msg)}"
+                is_critical = time_left_sec <= 2 * 3600
                 if is_captcha_error(code, msg):
                     if captcha_error:
                         reason = captcha_error
@@ -1229,15 +1300,20 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         reason = (
                             "令牌已生成并被服务端拒绝（invalid_captcha）；"
                             "官网手动续期同样报此错，属 vyce.cloud/Bestcap 侧校验故障，"
-                            "下次调度（每 2 小时）会自动重试"
+                            "下次调度会自动重试；已就绪 start 兜底保护"
                         )
+                        if is_critical:
+                            reason += "；⚠️ 机器剩余存活已不足 2 小时，临近到期！"
                         print("   ℹ️ 官网手动续期在同一环境下同样失败，本机无需调整。")
                     else:
                         reason = "服务端未收到有效 CAPTCHA 令牌"
                     error_msg += f"（CAPTCHA: {reason}）"
+
+                title_icon = "🚨" if is_critical else "❌"
+                title_text = "Vyce VPS 续期紧急告警 (临近到期)" if is_critical else "Vyce VPS 续期失败"
                 send_notification(
-                    status_icon="❌",
-                    status_title="Vyce VPS 续期失败",
+                    status_icon=title_icon,
+                    status_title=title_text,
                     account_name=real_username,
                     details=details,
                     error_msg=error_msg,
