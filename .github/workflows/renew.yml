@@ -2,9 +2,10 @@ name: Vyce.cloud Auto Renew
 
 on:
   schedule:
-    # 每 2 小时巡检一次。错开整点：GitHub 的定时任务在 :00 极度拥塞，
-    # 实测曾延迟近 1 小时才触发，对「到期前必须跑一次」的场景风险太大。
-    - cron: '17 */2 * * *'
+    # 每 6 小时巡检一次。错开整点（:17）规避 GitHub 定时任务在 :00 的拥塞队列。
+    # 免费 VPS 寿命 48h，24h 后开启续期窗口；每 6 小时巡检在 24h 窗口内至少有 4 次续期调度机会，
+    # 结合 /start 自动唤醒兜底与 14 天停机保留期，既保障高可用又节约 66% GitHub Actions 运行额度。
+    - cron: '17 */6 * * *'
   workflow_dispatch: # 支持 GitHub 控制台手动一键触发
     inputs:
       force:

@@ -51,7 +51,7 @@ Vyce.cloud 为免费 VPS（如 `Vps-Mini`，1 vCore / 2 GB RAM / 6 GB NVMe / 纯
 - **零依赖原生 Python** — 仅用标准库（`urllib`、`ssl`、`json`、`ipaddress`），无需 `pip install` 任何东西，开箱即用。
 - **双模驱动**：
   - **模式 A · 本地 CDP 无感捕获** — 本机 Chrome 开启 `--remote-debugging-port=9222` 后，自动从已登录标签页提取最新 `__Host-vyce_sid`，免手动复制粘贴。
-  - **模式 B · GitHub Actions 云端调度** — 配置 Secret 后每 2 小时自动巡检续期，零成本、零维护。
+  - **模式 B · GitHub Actions 云端调度** — 配置 Secret 后每 6 小时自动巡检续期，零成本、零维护。
 - **冷却期智能跳过** — 内置倒计时推算，冷却期内直接跳过续期请求，减少无效调用与被平台频控的风险。
 - **全协议代理支持** — 内置 `proxy_handler.py`，支持 VLESS、VMess、Hysteria2、TUIC、Trojan、AnyTLS、SOCKS5、HTTP(S)，以及双跳链式代理；Actions 中自动拉起 sing-box 并做健康探测。
 - **自动过 Bestcap CAPTCHA** — Vyce 续期接口要求提交 CAPTCHA 令牌。脚本用无头 Chrome + CDP 驱动官方验证组件完成校验，再把令牌随续期请求提交；令牌失效时自动重新求解并重试一次。
@@ -97,7 +97,7 @@ Vyce.cloud 为免费 VPS（如 `Vps-Mini`，1 vCore / 2 GB RAM / 6 GB NVMe / 纯
 
 > ⚠️ 续期需要完成 Bestcap CAPTCHA：工作流会先检查 `node`（18+）与 Chrome/Chromium。`ubuntu-latest` 运行器已预装两者，通常无需额外配置；若使用自建运行器或自定义路径，可通过仓库 **Variables** 设置 `CHROME_BIN`。
 
-工作流默认每 2 小时运行一次（`17 */2 * * *`），并支持手动指定 `force` 强制续期（忽略冷却保护，用于调试）。
+工作流默认每 6 小时运行一次（`17 */6 * * *`），并支持手动指定 `force` 强制续期（忽略冷却保护，用于调试）。
 
 ### 方式二：本地运行（搭配 Chrome 9222 端口）
 
