@@ -1284,16 +1284,24 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
             else:
                 print(f"   ❌ 续期失败 (HTTP {code}): {safe_error_text(msg)}")
                 account_ok = False
+                prev_srv_state = state.get(srv_id, {})
+                last_fail_notified_ts = prev_srv_state.get("last_fail_notified_ts", 0) if isinstance(prev_srv_state, dict) else 0
+
+                is_critical = time_left_sec <= 2 * 3600
+                is_captcha_fail = is_captcha_error(code, msg)
+                upstream_captcha_grace = is_captcha_fail and not is_critical
+
                 state[srv_id] = {
                     "name": srv_name,
                     "user": real_username,
                     "status": "failed",
                     "error": safe_error_text(msg),
                     "last_check_ts": now_ms,
+                    "last_fail_notified_ts": last_fail_notified_ts,
+                    "upstream_captcha_grace": upstream_captcha_grace,
                 }
                 error_msg = f"HTTP {code}: {safe_error_text(msg)}"
-                is_critical = time_left_sec <= 2 * 3600
-                if is_captcha_error(code, msg):
+                if is_captcha_fail:
                     if captcha_error:
                         reason = captcha_error
                     elif is_captcha_token_rejected(code, msg):
@@ -1309,16 +1317,24 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         reason = "服务端未收到有效 CAPTCHA 令牌"
                     error_msg += f"（CAPTCHA: {reason}）"
 
-                title_icon = "🚨" if is_critical else "❌"
-                title_text = "Vyce VPS 续期紧急告警 (临近到期)" if is_critical else "Vyce VPS 续期失败"
-                send_notification(
-                    status_icon=title_icon,
-                    status_title=title_text,
-                    account_name=real_username,
-                    details=details,
-                    error_msg=error_msg,
-                    proxy=proxy,
-                )
+                # 告警抑制机制：非紧急状态下的上游验证码故障在 8 小时内仅通知一次，避免每 2 小时定时调度轰炸
+                should_notify = True
+                if upstream_captcha_grace and (now_ms - last_fail_notified_ts < 8 * ONE_HOUR_MS):
+                    should_notify = False
+                    print(f"   ℹ️ 8小时内已发送过上游验证码故障告警，当前存活充足 ({time_left_str})，本轮抑制重复通知。")
+
+                if should_notify:
+                    state[srv_id]["last_fail_notified_ts"] = now_ms
+                    title_icon = "🚨" if is_critical else "❌"
+                    title_text = "Vyce VPS 续期紧急告警 (临近到期)" if is_critical else "Vyce VPS 续期失败"
+                    send_notification(
+                        status_icon=title_icon,
+                        status_title=title_text,
+                        account_name=real_username,
+                        details=details,
+                        error_msg=error_msg,
+                        proxy=proxy,
+                    )
 
     return account_ok
 
@@ -1350,6 +1366,7 @@ def main():
 
     state = load_state()
     all_success = True
+    has_critical_failure = False
 
     for acc in accounts:
         try:
@@ -1359,13 +1376,33 @@ def main():
         except Exception as e:
             print(f"❌ 处理账户 {mask_username(acc.get('name', ''))} 时出现未捕获异常: {safe_error_text(e)}")
             all_success = False
+            has_critical_failure = True
 
     if not save_state(state):
         all_success = False
+        has_critical_failure = True
+
     print(f"\n✅ 任务处理完毕，状态已保存至 {STATE_FILE}。")
     if not all_success:
-        print("❌ 检测到有账户处理失败或续期异常，以非零状态码退出 (exit 1)。")
-        sys.exit(1)
+        # 检查是否所有失败均属于非紧急期的上游验证码故障 (存活 > 2小时)
+        only_upstream_captcha_in_grace_period = True
+        failed_servers = [
+            s for s in state.values() if isinstance(s, dict) and s.get("status") == "failed"
+        ]
+        if not failed_servers or has_critical_failure:
+            only_upstream_captcha_in_grace_period = False
+        else:
+            for s in failed_servers:
+                if not s.get("upstream_captcha_grace", False):
+                    only_upstream_captcha_in_grace_period = False
+                    break
+
+        if only_upstream_captcha_in_grace_period:
+            print("ℹ️ 当前续期异常均属 Vyce 官方服务端 Bestcap 校验故障，且机器剩余存活时间充足（> 2小时）。")
+            print("ℹ️ 本轮处于宽限自动重试期，暂不作为致命异常退出 (exit 0)，避免触发无谓 CI 红线与报警邮件。")
+        else:
+            print("❌ 检测到有账户处理失败或续期紧急异常，以非零状态码退出 (exit 1)。")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

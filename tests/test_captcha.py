@@ -625,6 +625,120 @@ class TestStartServerFallback(unittest.TestCase):
         self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期紧急告警 (临近到期)")
         self.assertIn("不足 2 小时", notify.call_args.kwargs["error_msg"])
 
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_upstream_captcha_failure_notification_suppression_within_8_hours(self, client_cls, obtain, browser, notify):
+        """上游验证码故障在存活充足时，8 小时内抑制重复告警通知。"""
+        now = int(time.time() * 1000)
+        srv = {
+            "id": "srv-grace",
+            "name": "Grace VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now + 16 * app.ONE_HOUR_MS,  # 充裕存活 16 小时
+        }
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.return_value = [srv]
+        client_cls.return_value = client
+
+        state = {}
+        # 第 1 次调度：无历史通知记录，发送告警
+        ok1 = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertFalse(ok1)
+        self.assertEqual(notify.call_count, 1)
+        self.assertTrue(state["srv-grace"]["upstream_captcha_grace"])
+        self.assertEqual(state["srv-grace"]["last_fail_notified_ts"], now)
+
+        # 第 2 次调度（2小时后）：8小时内，抑制告警
+        two_hours_later = now + 2 * app.ONE_HOUR_MS
+        with patch("time.time", return_value=two_hours_later / 1000.0):
+            ok2 = app.process_account({"cookie": "secret", "name": "test"}, state)
+            self.assertFalse(ok2)
+            # 通知次数依然为 1（未增加）
+            self.assertEqual(notify.call_count, 1)
+
+        # 第 3 次调度（9小时后）：已超 8 小时，重新补发告警
+        nine_hours_later = now + 9 * app.ONE_HOUR_MS
+        with patch("time.time", return_value=nine_hours_later / 1000.0):
+            ok3 = app.process_account({"cookie": "secret", "name": "test"}, state)
+            self.assertFalse(ok3)
+            self.assertEqual(notify.call_count, 2)
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_upstream_captcha_failure_never_suppressed_when_critical(self, client_cls, obtain, browser, notify):
+        """临近到期 (<=2小时) 时绝不抑制告警，即使刚发送过。"""
+        now = int(time.time() * 1000)
+        srv_critical = {
+            "id": "srv-crit-suppress",
+            "name": "Critical Suppress VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now + app.ONE_HOUR_MS,  # 仅剩 1 小时
+        }
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.return_value = [srv_critical]
+        client_cls.return_value = client
+
+        # 伪造 10 分钟前刚发送过告警
+        state = {
+            "srv-crit-suppress": {
+                "last_fail_notified_ts": now - 10 * 60_000
+            }
+        }
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertFalse(ok)
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_icon"], "🚨")
+
+    @patch("app.save_state", return_value=True)
+    @patch("app.load_state")
+    @patch("app.load_accounts")
+    @patch("app.process_account", return_value=False)
+    def test_main_exits_zero_during_upstream_captcha_grace_period(self, process_mock, load_acc, load_st, save_st):
+        """当所有失败均为上游验证码宽限期 (存活>2h) 时，main() 不抛出 SystemExit(1)。"""
+        load_acc.return_value = [{"cookie": "c", "name": "acc"}]
+        load_st.return_value = {
+            "srv-1": {
+                "status": "failed",
+                "upstream_captcha_grace": True,
+            }
+        }
+        # 不应触发 SystemExit
+        try:
+            app.main()
+        except SystemExit as e:
+            self.fail(f"main() unexpectedly raised SystemExit({e.code}) during upstream captcha grace period")
+
+    @patch("app.save_state", return_value=True)
+    @patch("app.load_state")
+    @patch("app.load_accounts")
+    @patch("app.process_account", return_value=False)
+    def test_main_exits_one_on_critical_failure(self, process_mock, load_acc, load_st, save_st):
+        """当失败包含紧急告警或非验证码故障时，main() 抛出 SystemExit(1)。"""
+        load_acc.return_value = [{"cookie": "c", "name": "acc"}]
+        load_st.return_value = {
+            "srv-1": {
+                "status": "failed",
+                "upstream_captcha_grace": False,  # 紧急或非验证码错误
+            }
+        }
+        with self.assertRaises(SystemExit) as cm:
+            app.main()
+        self.assertEqual(cm.exception.code, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
