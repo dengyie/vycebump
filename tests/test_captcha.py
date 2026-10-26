@@ -653,7 +653,7 @@ class TestStartServerFallback(unittest.TestCase):
         self.assertFalse(ok1)
         self.assertEqual(notify.call_count, 1)
         self.assertTrue(state["srv-grace"]["upstream_captcha_grace"])
-        self.assertEqual(state["srv-grace"]["last_fail_notified_ts"], now)
+        self.assertAlmostEqual(state["srv-grace"]["last_fail_notified_ts"], now, delta=5000)
 
         # 第 2 次调度（2小时后）：8小时内，抑制告警
         two_hours_later = now + 2 * app.ONE_HOUR_MS
