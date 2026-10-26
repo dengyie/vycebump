@@ -10,6 +10,7 @@ Bestcap CAPTCHA 相关单元测试。
 import json
 import os
 import sys
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -457,6 +458,172 @@ class TestRenewOutputParsing(unittest.TestCase):
         result, reason = app.renew_with_captcha(None, "srv-1", "cookie")
         self.assertIsNone(result)
         self.assertIn("Chrome", reason)
+
+
+class TestStartServerFallback(unittest.TestCase):
+    def test_interpret_start_response_mapping(self):
+        self.assertEqual(app.interpret_start_response(204, ""), (True, 204, "Server started"))
+        self.assertEqual(
+            app.interpret_start_response(200, '{"server":{"id":"srv-1","status":"running"}}'),
+            (True, 200, "Server started"),
+        )
+        self.assertEqual(
+            app.interpret_start_response(200, '{"success":true,"message":"Started"}'),
+            (True, 200, "Started"),
+        )
+        self.assertEqual(
+            app.interpret_start_response(400, '{"error":"bad_request"}'),
+            (False, 400, "bad_request"),
+        )
+        self.assertEqual(
+            app.interpret_start_response(200, 'not-json'),
+            (False, 200, "Invalid start response JSON"),
+        )
+
+    @patch("app.http_request", return_value=(200, {}, '{"server":{"id":"srv-1","status":"running"}}'))
+    def test_start_server_request_headers_and_body(self, request):
+        client = app.VyceClient("__Host-vyce_sid=secret")
+        ok, code, msg = client.start_server("srv-1")
+        self.assertTrue(ok)
+        self.assertEqual(code, 200)
+        self.assertEqual(msg, "Server started")
+
+        kwargs = request.call_args.kwargs
+        self.assertEqual(kwargs["method"], "POST")
+        self.assertEqual(kwargs["data"], b"{}")
+        self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
+        self.assertEqual(kwargs["headers"]["Origin"], "https://vyce.cloud")
+        self.assertEqual(kwargs["headers"]["Referer"], "https://vyce.cloud/")
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha")
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_stopped_server_prefers_start_api(self, client_cls, obtain, browser, notify):
+        """已关机的免费机型优先走 start 接口完成 Renew and start，无需触碰验证码。"""
+        now = int(time.time() * 1000)
+        stopped_srv = {
+            "id": "srv-stopped",
+            "name": "Stopped VPS",
+            "source": "free",
+            "status": "stopped",
+            "expiresAt": now - 3600_000,
+        }
+        started_srv = dict(stopped_srv, status="running", expiresAt=now + 48 * app.ONE_HOUR_MS)
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.side_effect = [[stopped_srv], [started_srv]]
+        client.start_server.return_value = (True, 200, "Server started")
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertTrue(ok)
+        client.start_server.assert_called_once_with("srv-stopped")
+        client.renew_server.assert_not_called()
+        browser.assert_not_called()
+        obtain.assert_not_called()
+        self.assertEqual(state["srv-stopped"]["status"], "success")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha")
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_expired_server_prefers_start_api(self, client_cls, obtain, browser, notify):
+        """存活时间已尽 (time_left <= 0) 的服务器优先走 start 接口。"""
+        now = int(time.time() * 1000)
+        expired_srv = {
+            "id": "srv-expired",
+            "name": "Expired VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now - 1000,
+        }
+        renewed_srv = dict(expired_srv, status="running", expiresAt=now + 48 * app.ONE_HOUR_MS)
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.side_effect = [[expired_srv], [renewed_srv]]
+        client.start_server.return_value = (True, 200, "Server started")
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertTrue(ok)
+        client.start_server.assert_called_once_with("srv-expired")
+        client.renew_server.assert_not_called()
+        self.assertEqual(state["srv-expired"]["status"], "success")
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_failed_captcha_falls_back_to_start_if_server_becomes_stopped(self, client_cls, obtain, browser, notify):
+        """验证码续期失败后，若核验到机器已停机，自动触发 start 兜底并判定成功。"""
+        now = int(time.time() * 1000)
+        srv_running = {
+            "id": "srv-fb",
+            "name": "Fallback VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now + 3600_000,
+        }
+        srv_stopped = dict(srv_running, status="stopped")
+        srv_revived = dict(srv_running, status="running", expiresAt=now + 48 * app.ONE_HOUR_MS)
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.side_effect = [
+            [srv_running],  # 首次读取
+            [srv_stopped],  # 续期失败后二次查询发现已停机
+            [srv_revived],  # start 兜底调用后状态刷新
+        ]
+        client.start_server.return_value = (True, 200, "Server started")
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertTrue(ok)
+        client.start_server.assert_called_once_with("srv-fb")
+        self.assertEqual(state["srv-fb"]["status"], "success")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_critical_alert_sent_when_time_left_under_two_hours(self, client_cls, obtain, browser, notify):
+        """存活不足 2 小时且验证码被拒：告警升级为紧急图标与标题。"""
+        now = int(time.time() * 1000)
+        critical_srv = {
+            "id": "srv-crit",
+            "name": "Critical VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now + 3600_000,  # 仅剩 1 小时
+        }
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.side_effect = [[critical_srv], [critical_srv]]
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertFalse(ok)
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_icon"], "🚨")
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期紧急告警 (临近到期)")
+        self.assertIn("不足 2 小时", notify.call_args.kwargs["error_msg"])
 
 
 if __name__ == "__main__":
