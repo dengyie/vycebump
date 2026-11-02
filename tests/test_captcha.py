@@ -632,6 +632,37 @@ class TestStartServerFallback(unittest.TestCase):
     ))
     @patch("app.obtain_captcha_token")
     @patch("app.VyceClient")
+    def test_critical_alert_explains_automatic_start_fallback_self_healing(self, client_cls, obtain, browser, notify):
+        """2026-11-02 事故回归：CAPTCHA 平台故障导致的临期紧急告警，必须写明停机后由
+        start 兜底自动唤醒续期（零人工干预），避免用户误以为需要人工抢修。"""
+        now = int(time.time() * 1000)
+        critical_srv = {
+            "id": "srv-crit-heal",
+            "name": "Critical VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now + 3600_000,  # 仅剩 1 小时
+        }
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.side_effect = [[critical_srv], [critical_srv]]
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+        self.assertFalse(ok)
+        notify.assert_called_once()
+        error_msg = notify.call_args.kwargs["error_msg"]
+        self.assertIn("start 兜底自动唤醒续期", error_msg)
+        self.assertIn("无需人工干预", error_msg)
+
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
     def test_upstream_captcha_failure_notification_suppression_within_8_hours(self, client_cls, obtain, browser, notify):
         """上游验证码故障在存活充足时，8 小时内抑制重复告警通知。"""
         now = int(time.time() * 1000)

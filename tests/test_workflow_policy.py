@@ -25,6 +25,26 @@ class TestWorkflowPolicy(unittest.TestCase):
         self.assertIn("concurrency:", self.content)
         self.assertIn("cancel-in-progress: false", self.content)
 
+    def test_renewal_schedule_guarantees_fallback_within_three_hours(self):
+        """2026-11-02 事故回归：CAPTCHA 故障打穿窗口致停机后，兜底唤醒等待不得再依赖 6h 间隔。
+
+        主巡检 (UTC 00/06/12/18 :17) + 补充巡检 (UTC 03/09/15/21 :17) 必须交替等距覆盖，
+        使机器停机后 /start 兜底的最大等待 ≤ 3h + GitHub 调度抖动。
+        """
+        crons = re.findall(r"- cron:\s*'([^']+)'", self.content)
+        self.assertIn("17 */6 * * *", crons, "缺少每 6 小时主巡检 cron")
+        self.assertIn("17 3,9,15,21 * * *", crons, "缺少每 3 小时补充巡检 cron（UTC 03/09/15/21 :17）")
+
+        # 主巡检与补充巡检时刻交替，验证全 24 小时无 >3h 的调度空窗
+        hours = set()
+        for expr in crons:
+            hour_field = expr.split()[1]
+            if hour_field == "*/6":
+                hours.update(range(0, 24, 6))
+            else:
+                hours.update(int(h) for h in hour_field.split(","))
+        self.assertEqual(sorted(hours), [0, 3, 6, 9, 12, 15, 18, 21])
+
     def test_actions_pinned_to_immutable_commit_hashes(self):
         # Disallow mutable tags like @v4 or @v5 without SHA
         unpinned_patterns = [

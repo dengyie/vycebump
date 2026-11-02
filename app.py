@@ -1311,7 +1311,14 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                             "下次调度会自动重试；已就绪 start 兜底保护"
                         )
                         if is_critical:
-                            reason += "；⚠️ 机器剩余存活已不足 2 小时，临近到期！"
+                            # 区分两态：CAPTCHA 平台故障导致的临期 ≠ 真掉机风险。
+                            # 机器到期停机后，/start 兜底免验证码唤醒续期（Renew and start），
+                            # 停机保留 14 天，下一轮调度（≤6h，3h 补充巡检生效后 ≤3h）即自动拉起。
+                            reason += (
+                                "；⚠️ 机器剩余存活已不足 2 小时，临近到期！"
+                                "机器到期停机后无需人工干预：停机数据保留，"
+                                "下一轮调度将通过 start 兜底自动唤醒续期"
+                            )
                         print("   ℹ️ 官网手动续期在同一环境下同样失败，本机无需调整。")
                     else:
                         reason = "服务端未收到有效 CAPTCHA 令牌"
