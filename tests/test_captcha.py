@@ -408,6 +408,25 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
         notify.assert_called_once()
         self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
 
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(None, "browser path disabled in tests"))
+    @patch("app.obtain_captcha_token", return_value=(VALID_TOKEN, ""))
+    @patch("app.VyceClient")
+    def test_success_response_with_unchanged_expiry_is_unverified(self, client_cls, obtain, browser, notify):
+        """续期接口返回 200 但到期时间未刷新时，不得记录为成功。"""
+        client = self._stub_client(
+            client_cls,
+            [(True, 200, "Renewed successfully")],
+            refreshed_servers=[self.server],
+        )
+        state = {}
+        ok = app.process_account(self.account, state)
+        self.assertFalse(ok)
+        self.assertEqual(state["srv-captcha"]["status"], "renewed_unverified")
+        self.assertIn("未来", state["srv-captcha"]["error"])
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_title"], "续期成功但状态未验证")
+
 
 class TestRenewOutputParsing(unittest.TestCase):
     def test_parses_renew_json_line(self):
@@ -556,6 +575,100 @@ class TestStartServerFallback(unittest.TestCase):
         client.start_server.assert_called_once_with("srv-expired")
         client.renew_server.assert_not_called()
         self.assertEqual(state["srv-expired"]["status"], "success")
+
+    def test_expiry_verification_rejects_timestamp_that_is_still_in_the_past(self):
+        now = int(time.time() * 1000)
+        self.assertFalse(
+            app.has_verified_live_expiry(
+                {"expiresAt": now - 1000}, now - 120_000, now_ms=now
+            )
+        )
+        self.assertTrue(
+            app.has_verified_live_expiry(
+                {"expiresAt": now + app.ONE_HOUR_MS}, now - 120_000, now_ms=now
+            )
+        )
+
+    @patch("app.time.sleep")
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha", return_value=(
+        (False, 400, "{\"error\":\"invalid_captcha\",\"message\":\"CAPTCHA verification failed. Please try again.\"}"),
+        "",
+    ))
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_expired_running_server_stays_failed_when_start_does_not_extend_expiry(
+        self, client_cls, obtain, browser, notify, sleep
+    ):
+        """线上 41783889491 回归：start 200 但状态不变时绝不能假报成功。"""
+        now = int(time.time() * 1000)
+        expired_srv = {
+            "id": "srv-stale",
+            "name": "Stale VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now - 1000,
+        }
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.return_value = [expired_srv]
+        client.start_server.return_value = (True, 200, "Server started")
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+
+        self.assertFalse(ok)
+        self.assertEqual(state["srv-stale"]["status"], "failed")
+        self.assertEqual(client.start_server.call_count, 2)
+        self.assertGreaterEqual(sleep.call_count, 1)
+        self.assertNotEqual(state["srv-stale"]["status"], "success")
+        notify.assert_called_once()
+
+    @patch("app.time.sleep")
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha")
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_start_retries_after_delayed_stopped_transition(
+        self, client_cls, obtain, browser, notify, sleep
+    ):
+        """平台延迟把过期 running 状态切成 stopped 时，轮询后重试 start 并恢复。"""
+        now = int(time.time() * 1000)
+        expired_srv = {
+            "id": "srv-delayed",
+            "name": "Delayed VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now - 1000,
+        }
+        stopped_srv = dict(expired_srv, status="stopped")
+        renewed_srv = dict(expired_srv, status="running", expiresAt=now + 48 * app.ONE_HOUR_MS)
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.side_effect = [
+            [expired_srv],  # 首次读取
+            [expired_srv],  # 第一次 start 仍返回旧状态
+            [stopped_srv],  # 平台完成停机状态切换
+            [renewed_srv],  # 第二次 start 后续期生效
+        ]
+        client.start_server.return_value = (True, 200, "Server started")
+        client_cls.return_value = client
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+
+        self.assertTrue(ok)
+        self.assertEqual(client.start_server.call_count, 2)
+        client.renew_server.assert_not_called()
+        browser.assert_not_called()
+        obtain.assert_not_called()
+        self.assertEqual(state["srv-delayed"]["status"], "success")
+        notify.assert_called_once()
+        self.assertIn(5, [call.args[0] for call in sleep.call_args_list])
+        self.assertIn(15, [call.args[0] for call in sleep.call_args_list])
 
     @patch("app.send_notification")
     @patch("app.renew_with_captcha", return_value=(

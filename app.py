@@ -100,6 +100,9 @@ DEFAULT_UA = (
 # 冷却期常量 (毫秒)
 ONE_HOUR_MS = 3600 * 1000
 ONE_DAY_MS = 24 * ONE_HOUR_MS
+# start 接口可能先返回 200，再异步切换服务器状态；轮询有界，避免假绿或长时间占用 runner。
+START_VERIFY_DELAYS_SEC = (0, 5, 15, 30, 60)
+EXPIRY_ADVANCE_TOLERANCE_MS = 60 * 1000
 
 
 # ============================================================
@@ -967,6 +970,73 @@ class VyceClient:
         return interpret_start_response(status, body)
 
 
+def has_verified_live_expiry(
+    server: Dict,
+    previous_expires_at: float,
+    now_ms: Optional[int] = None,
+) -> bool:
+    """只有到期时间已在未来且相对动作前确实前移，才算恢复/续期成功。"""
+    current_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    new_expires_at = server.get("expiresAt")
+    return (
+        isinstance(new_expires_at, (int, float))
+        and new_expires_at > current_now_ms
+        and new_expires_at > previous_expires_at + EXPIRY_ADVANCE_TOLERANCE_MS
+    )
+
+
+def start_and_verify(
+    client: VyceClient,
+    server_id: str,
+    previous_expires_at: float,
+) -> Tuple[bool, int, str, Optional[Dict]]:
+    """调用 start 并等待平台完成状态切换，返回已验证的服务器记录。"""
+    start_code = 0
+    start_msg = ""
+    start_pending = True
+    last_server: Optional[Dict] = None
+
+    for delay in START_VERIFY_DELAYS_SEC:
+        if delay:
+            time.sleep(delay)
+
+        if start_pending:
+            start_ok, start_code, start_msg = client.start_server(server_id)
+            if not start_ok:
+                return False, start_code, start_msg, None
+            start_pending = False
+
+        fresh_servers = client.get_servers()
+        if fresh_servers is None:
+            start_msg = client.last_error or "启动后无法读取服务器状态"
+            continue
+
+        last_server = next((s for s in fresh_servers if s.get("id") == server_id), None)
+        if last_server and has_verified_live_expiry(last_server, previous_expires_at):
+            return True, start_code, start_msg, last_server
+
+        # Vyce 可能先返回 running + expired，再异步切换为 stopped；
+        # 看到 stopped 后下一轮重新调用 start，才能触发免 CAPTCHA 的 Renew and start。
+        if last_server and last_server.get("status") == "stopped":
+            start_pending = True
+
+    # 最后一轮刚好观察到 stopped 时，再立即补一次 start，避免白等到下一次 cron。
+    if start_pending and last_server and last_server.get("status") == "stopped":
+        start_ok, start_code, start_msg = client.start_server(server_id)
+        if start_ok:
+            fresh_servers = client.get_servers()
+            if fresh_servers:
+                last_server = next((s for s in fresh_servers if s.get("id") == server_id), None)
+                if last_server and has_verified_live_expiry(last_server, previous_expires_at):
+                    return True, start_code, start_msg, last_server
+
+    if start_msg:
+        start_msg = f"start 响应未验证为续期成功: {safe_error_text(start_msg)}"
+    else:
+        start_msg = "start 响应未验证为续期成功"
+    return False, start_code, start_msg, None
+
+
 # ============================================================
 # 状态持久化与单服务器续期逻辑
 # ============================================================
@@ -1110,22 +1180,17 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
         # 官方平台机制：对 stopped 或已过期的服务器调用 start 接口时直接按 "Renew and start" 处理，无需 CAPTCHA
         if status == "stopped" or time_left_ms <= 0:
             print(f"   ⚡ 检测到服务器状态为 {status} 且存活时间已到期或关机，优先调用 start 接口唤醒/续期 (Renew and start)...")
-            start_ok, start_code, start_msg = client.start_server(srv_id)
+            start_ok, start_code, start_msg, started_srv = start_and_verify(
+                client, srv_id, expires_at
+            )
             if start_ok:
-                fresh_servers = client.get_servers()
-                if fresh_servers:
-                    check_srv = next((s for s in fresh_servers if s.get("id") == srv_id), None)
-                    if check_srv and (
-                        check_srv.get("expiresAt", 0) > expires_at + 60_000
-                        or (check_srv.get("status") == "running" and check_srv.get("expiresAt", 0) > now_ms)
-                    ):
-                        print(f"   🎉 start 接口调用成功，服务器已唤醒并成功续期！(到期: {ms_to_beijing_str(check_srv['expiresAt'])})")
-                        success = True
-                        code = start_code
-                        msg = "Renewed and started via start API"
-                        fresh_srv = check_srv
+                print(f"   🎉 start 接口调用成功，服务器已唤醒并成功续期！(到期: {ms_to_beijing_str(started_srv['expiresAt'])})")
+                success = True
+                code = start_code
+                msg = "Renewed and started via start API"
+                fresh_srv = started_srv
             if not success:
-                print(f"   ⚠️ start 接口未直接完成续期 (HTTP {start_code}: {safe_error_text(start_msg)})，继续尝试 CAPTCHA 续期流程...")
+                print(f"   ⚠️ start 接口未验证为续期成功 (HTTP {start_code}: {safe_error_text(start_msg)})，继续尝试 CAPTCHA 续期流程...")
 
         if not success:
             attempts = 2 if CAPTCHA_ENABLED else 1
@@ -1165,7 +1230,7 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
             if fresh_servers:
                 check_srv = next((s for s in fresh_servers if s.get("id") == srv_id), None)
                 if check_srv and isinstance(check_srv.get("expiresAt"), (int, float)):
-                    if check_srv["expiresAt"] > expires_at + 60_000:
+                    if has_verified_live_expiry(check_srv, expires_at):
                         print(
                             f"   ✨ 续期请求返回 HTTP {code} ({safe_error_text(msg)})，"
                             f"但经状态核验到期时间已更新（{ms_to_beijing_str(expires_at)} -> {ms_to_beijing_str(check_srv['expiresAt'])}），"
@@ -1175,21 +1240,17 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         msg = f"Renewed successfully (verified via server expiresAt: {ms_to_beijing_str(check_srv['expiresAt'])})"
                         fresh_srv = check_srv
                     elif check_srv.get("status") == "stopped" or check_srv.get("expiresAt", 0) <= now_ms:
-                        # 续期未成功且机器处于停机或已超时状态，追加尝试 start 兜底唤醒
+                        # 续期未成功且机器处于停机或已超时状态，追加尝试 start 兜底唤醒；
+                        # 平台可能需要几秒才把 running + expired 切换为 stopped。
                         print(f"   ⚡ 续期未成功且机器处于 {check_srv.get('status')} 状态，追加尝试 start 兜底...")
-                        st_ok, st_code, st_msg = client.start_server(srv_id)
+                        st_ok, st_code, st_msg, st_srv = start_and_verify(
+                            client, srv_id, expires_at
+                        )
                         if st_ok:
-                            st_servers = client.get_servers()
-                            if st_servers:
-                                st_srv = next((s for s in st_servers if s.get("id") == srv_id), None)
-                                if st_srv and (
-                                    st_srv.get("expiresAt", 0) > expires_at + 60_000
-                                    or (st_srv.get("status") == "running" and st_srv.get("expiresAt", 0) > now_ms)
-                                ):
-                                    print(f"   🎉 追加 start 兜底成功，服务器已启动并续期！(到期: {ms_to_beijing_str(st_srv['expiresAt'])})")
-                                    success = True
-                                    msg = "Renewed and started via start API fallback"
-                                    fresh_srv = st_srv
+                            print(f"   🎉 追加 start 兜底成功，服务器已启动并续期！(到期: {ms_to_beijing_str(st_srv['expiresAt'])})")
+                            success = True
+                            msg = "Renewed and started via start API fallback"
+                            fresh_srv = st_srv
 
         if success:
             print(f"   🎉 续期成功！({msg})")
@@ -1219,9 +1280,9 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                 )
                 continue
             fresh_srv = next((s for s in fresh_servers if s.get("id") == srv_id), None)
-            if not fresh_srv or not isinstance(fresh_srv.get("expiresAt"), (int, float)):
-                error = "续期后响应中未找到服务器"
-                print(f"   ⚠️ 续期请求已接受，但无法验证服务器状态。")
+            if not fresh_srv or not has_verified_live_expiry(fresh_srv, expires_at):
+                error = "续期后未验证到未来的有效期"
+                print(f"   ⚠️ 续期请求已接受，但到期时间未确认刷新到未来。")
                 account_ok = False
                 state[srv_id] = {
                     "name": srv_name,
