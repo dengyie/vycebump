@@ -82,6 +82,13 @@ class TestWorkflowPolicy(unittest.TestCase):
         self.assertIn("command -v node", self.content)
         self.assertIn("command -v google-chrome", self.content)
 
+    def test_autonexus_agent_delegation_env_vars_declared(self):
+        """AutoNexus SRE Agent 前置处置与静默策略所需环境变量注入检查。"""
+        self.assertIn("AUTONEXUS_ALERT_TOKEN", self.content)
+        self.assertIn("AUTONEXUS_ALERT_URL", self.content)
+        self.assertIn("AUTONEXUS_AGENT_ENABLED", self.content)
+        self.assertIn("NOTIFY_ON_SUCCESS", self.content)
+
 
 if __name__ == "__main__":
     unittest.main()

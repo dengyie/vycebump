@@ -72,6 +72,12 @@ ONEMAIL_CREDENTIAL = os.environ.get("ONEMAIL_CREDENTIAL") or ""
 ONEMAIL_FROM_NAME = os.environ.get("ONEMAIL_FROM_NAME") or "Vycebump"
 CDP_URL = os.environ.get("CDP_URL") or "http://127.0.0.1:9222"
 FORCE_RENEW = os.environ.get("FORCE_RENEW", "").lower() in ("true", "1", "yes")
+
+# 通知策略与 AutoNexus Agent 委派配置
+NOTIFY_ON_SUCCESS = os.environ.get("NOTIFY_ON_SUCCESS", "false").lower() in ("1", "true", "yes", "on")
+AUTONEXUS_ALERT_URL = os.environ.get("AUTONEXUS_ALERT_URL", "https://monitor.mangoqwq.com/api/v1/alerts/ingest")
+AUTONEXUS_ALERT_TOKEN = os.environ.get("AUTONEXUS_ALERT_TOKEN") or os.environ.get("FLEET_AUTH_TOKEN") or ""
+AUTONEXUS_AGENT_ENABLED = os.environ.get("AUTONEXUS_AGENT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(SCRIPT_DIR, "renew_state.json")
 
@@ -555,6 +561,77 @@ def build_notification(
     return {"plain": "\n".join(plain_lines), "html": "\n".join(html_lines), "subject": subject}
 
 
+def delegate_alert_to_agent(
+    status_icon: str,
+    status_title: str,
+    account_name: str,
+    details: Optional[Dict] = None,
+    error_msg: str = "",
+    is_critical: bool = False,
+    proxy: Optional[str] = None,
+) -> bool:
+    """将异常告警优先委派给 AutoNexus Agent 自动处置。
+
+    成功接收后返回 True，此时抑制即时 Telegram 发送（由 Agent 自愈失败后再报警）；
+    未配置、禁用或发送失败返回 False，触发调用方回退直发 Telegram 兜底。
+    """
+    token = os.environ.get("AUTONEXUS_ALERT_TOKEN") or os.environ.get("FLEET_AUTH_TOKEN") or AUTONEXUS_ALERT_TOKEN
+    url = os.environ.get("AUTONEXUS_ALERT_URL") or AUTONEXUS_ALERT_URL
+    enabled = os.environ.get("AUTONEXUS_AGENT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    if not enabled or not token or not url:
+        return False
+
+    server_id = (details or {}).get("server_id") or (details or {}).get("server_name") or "mini-01"
+    summary = (
+        f"{status_icon} {status_title}: {safe_error_text(error_msg, 200)}"
+        if error_msg
+        else f"{status_icon} {status_title}"
+    )
+    severity = "CRITICAL" if is_critical else "ERROR"
+    payload_dict = {
+        "source": "vycebump",
+        "rule": "vyce_renew_failed",
+        "target": f"vyce:{mask_username(account_name)}:{server_id}",
+        "severity": severity,
+        "summary": summary,
+        "dedup_key": f"vycebump:{account_name}:{server_id}",
+        "details": {
+            "account": mask_username(account_name),
+            "status_title": status_title,
+            "error_msg": safe_error_text(error_msg, 500),
+            "server_details": details or {},
+        },
+    }
+    payload_bytes = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "X-Alert-Source": "vycebump",
+    }
+    try:
+        status, _, body = http_request(
+            url,
+            method="POST",
+            headers=headers,
+            data=payload_bytes,
+            proxy=proxy,
+            timeout=15,
+        )
+        if status in (200, 201, 202):
+            try:
+                resp_data = json.loads(body) if body else {}
+            except (TypeError, ValueError):
+                resp_data = {}
+            if resp_data.get("success") is not False:
+                print("🤖 告警已成功委派给 AutoNexus Agent 自动处置（TG 告警已暂缓，Agent 处置失败将自动升级）")
+                return True
+        print(f"⚠️ 委派 AutoNexus Agent 响应异常 (HTTP {status}): {safe_error_text(body, 120)}")
+        return False
+    except Exception as exc:
+        print(f"⚠️ 委派 AutoNexus Agent 请求失败: {safe_error_text(exc, 120)}")
+        return False
+
+
 def send_notification(
     status_icon: str,
     status_title: str,
@@ -562,11 +639,49 @@ def send_notification(
     details: Optional[Dict] = None,
     error_msg: str = "",
     proxy: Optional[str] = None,
+    is_critical: bool = False,
 ):
-    """统一通知入口：向所有已配置的渠道 (Telegram / Email / One-Mail) 推送同一消息。"""
-    send_tg_message(status_icon, status_title, account_name, details, error_msg, proxy)
-    send_email_message(status_icon, status_title, account_name, details, error_msg, proxy)
-    send_onemail_message(status_icon, status_title, account_name, details, error_msg, proxy)
+    """统一通知入口：向所有已配置的渠道 (Telegram / Email / One-Mail) 推送消息。
+
+    1. 成功通知：续期成功默认不报 TG（受 NOTIFY_ON_SUCCESS 约束，基本不报，拉活成功不报）。
+    2. 故障通知：优先委派 AutoNexus Agent 自愈处置；委派成功则暂缓 TG，未配置或失败则零丢失降级直发 TG。
+    """
+    is_anomaly = (
+        status_icon in ("❌", "⚠️", "🚨")
+        or any(w in status_title for w in ("未验证", "失败", "失效", "异常", "错误", "退出"))
+    )
+    is_success = not is_anomaly and (status_icon in ("🎉", "✅") or "成功" in status_title)
+
+    notify_success_env = os.environ.get("NOTIFY_ON_SUCCESS")
+    if notify_success_env is not None:
+        notify_success = notify_success_env.lower() in ("1", "true", "yes", "on")
+    else:
+        notify_success = NOTIFY_ON_SUCCESS
+
+    if is_success:
+        if notify_success:
+            send_tg_message(status_icon, status_title, account_name, details, error_msg, proxy)
+            send_email_message(status_icon, status_title, account_name, details, error_msg, proxy)
+            send_onemail_message(status_icon, status_title, account_name, details, error_msg, proxy)
+        else:
+            print("ℹ️ NOTIFY_ON_SUCCESS=false，续期成功静默，不发 TG / 邮件通知。")
+        return
+
+    # 故障告警：优先委派 AutoNexus Agent 自动处置
+    delegated = delegate_alert_to_agent(
+        status_icon=status_icon,
+        status_title=status_title,
+        account_name=account_name,
+        details=details,
+        error_msg=error_msg,
+        is_critical=is_critical,
+        proxy=proxy,
+    )
+    if not delegated:
+        print("⚠️ 委派 AutoNexus Agent 失败或未配置，自动回退到直发告警 (TG / Email / One-Mail)。")
+        send_tg_message(status_icon, status_title, account_name, details, error_msg, proxy)
+        send_email_message(status_icon, status_title, account_name, details, error_msg, proxy)
+        send_onemail_message(status_icon, status_title, account_name, details, error_msg, proxy)
 
 
 def send_tg_message(
@@ -1082,6 +1197,7 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
             account_name=account_label,
             error_msg=client.last_error or "无法通过 /api/me 获取用户信息。",
             proxy=proxy,
+            is_critical=True,
         )
         return False
 
@@ -1098,6 +1214,7 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
             account_name=real_username,
             error_msg=error,
             proxy=proxy,
+            is_critical=True,
         )
         return False
     if not servers:
@@ -1402,6 +1519,7 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         details=details,
                         error_msg=error_msg,
                         proxy=proxy,
+                        is_critical=is_critical,
                     )
 
     return account_ok

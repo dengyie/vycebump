@@ -48,8 +48,9 @@ class TestBuildNotification(unittest.TestCase):
 
 
 class TestNotificationDispatch(unittest.TestCase):
-    def test_dispatch_fans_out_to_all_channels(self):
-        with patch("app.send_tg_message") as mock_tg, \
+    def test_dispatch_fans_out_to_all_channels_when_notify_on_success(self):
+        with patch.object(app, "NOTIFY_ON_SUCCESS", True), \
+                patch("app.send_tg_message") as mock_tg, \
                 patch("app.send_email_message") as mock_email, \
                 patch("app.send_onemail_message") as mock_onemail:
             app.send_notification("🎉", "续期成功", "user", details={"server_name": "vps-mini"}, proxy="http://127.0.0.1:8080")
@@ -57,6 +58,51 @@ class TestNotificationDispatch(unittest.TestCase):
         mock_tg.assert_called_once_with(*expected)
         mock_email.assert_called_once_with(*expected)
         mock_onemail.assert_called_once_with(*expected)
+
+    def test_dispatch_silences_success_by_default(self):
+        with patch.object(app, "NOTIFY_ON_SUCCESS", False), \
+                patch("app.send_tg_message") as mock_tg, \
+                patch("app.send_email_message") as mock_email:
+            app.send_notification("🎉", "续期成功", "user", details={"server_name": "vps-mini"})
+        mock_tg.assert_not_called()
+        mock_email.assert_not_called()
+
+    def test_failure_delegates_to_agent_and_suppresses_tg(self):
+        with patch("app.delegate_alert_to_agent", return_value=True) as mock_agent, \
+                patch("app.send_tg_message") as mock_tg, \
+                patch("app.send_email_message") as mock_email, \
+                patch("app.send_onemail_message") as mock_onemail:
+            app.send_notification("❌", "续期失败", "user", error_msg="HTTP 500")
+        mock_agent.assert_called_once()
+        mock_tg.assert_not_called()
+        mock_email.assert_not_called()
+        mock_onemail.assert_not_called()
+
+    def test_failure_falls_back_to_tg_when_agent_delegation_fails(self):
+        with patch("app.delegate_alert_to_agent", return_value=False) as mock_agent, \
+                patch("app.send_tg_message") as mock_tg, \
+                patch("app.send_email_message") as mock_email, \
+                patch("app.send_onemail_message") as mock_onemail:
+            app.send_notification("❌", "续期失败", "user", error_msg="HTTP 500")
+        mock_agent.assert_called_once()
+        mock_tg.assert_called_once()
+        mock_email.assert_called_once()
+        mock_onemail.assert_called_once()
+
+    def test_agent_delegation_http_payload(self):
+        with patch.object(app, "AUTONEXUS_AGENT_ENABLED", True), \
+                patch.object(app, "AUTONEXUS_ALERT_TOKEN", "test-token"), \
+                patch.object(app, "AUTONEXUS_ALERT_URL", "https://monitor.mangoqwq.com/api/v1/alerts/ingest"), \
+                patch("app.http_request", return_value=(200, {}, json.dumps({"success": True}))) as mock_http:
+            res = app.delegate_alert_to_agent("❌", "续期失败", "myuser@example.com", error_msg="HTTP 500", is_critical=True)
+            self.assertTrue(res)
+            mock_http.assert_called_once()
+            _, kwargs = mock_http.call_args
+            req_data = json.loads(kwargs["data"].decode("utf-8"))
+            self.assertEqual(req_data["source"], "vycebump")
+            self.assertEqual(req_data["severity"], "CRITICAL")
+            self.assertEqual(req_data["rule"], "vyce_renew_failed")
+            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-token")
 
     def test_build_notification_subject_shared(self):
         content = app.build_notification("🎉", "续期成功", "someone@example.com")
