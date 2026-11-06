@@ -158,6 +158,10 @@ jobs:
         PROXY_SERVER: ${{ steps.proxy.outputs.proxy_server }}
         CAPTCHA_SOLVER: ${{ vars.CAPTCHA_SOLVER || 'auto' }}
         CHROME_BIN: ${{ vars.CHROME_BIN }}
+        AUTONEXUS_ALERT_TOKEN: ${{ secrets.AUTONEXUS_ALERT_TOKEN }}
+        AUTONEXUS_ALERT_URL: ${{ vars.AUTONEXUS_ALERT_URL || secrets.AUTONEXUS_ALERT_URL || 'https://monitor.mangoqwq.com/api/v1/alerts/ingest' }}
+        AUTONEXUS_AGENT_ENABLED: ${{ vars.AUTONEXUS_AGENT_ENABLED || 'true' }}
+        NOTIFY_ON_SUCCESS: ${{ vars.NOTIFY_ON_SUCCESS || 'false' }}
       run: python3 app.py
 
     - name: Upload Diagnostic Logs
